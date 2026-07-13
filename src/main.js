@@ -1,0 +1,3180 @@
+import * as THREE from "three";
+import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { ConvexGeometry } from "three/examples/jsm/geometries/ConvexGeometry.js";
+import {
+  NfpPlacer,
+  getPolygonBounds,
+  initWasm,
+  convexHull,
+  wasmInstance,
+} from "./nfpPlacer.mjs";
+import { parse3MF, initLib3mf } from "./lib3mfLoader.mjs";
+initWasm();
+initLib3mf().catch(() => {});
+
+import * as layflat from "./Layflatnormal.mjs";
+import {
+  buildProjectedFootprint,
+  createShapeFromPoints,
+} from "./footprintProjection.mjs";
+
+const loader = new STLLoader();
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, innerWidth / innerHeight);
+camera.position.set(0, 10, 100);
+camera.lookAt(scene.position);
+camera.near = 0.1;
+camera.far = 1000;
+
+const renderer = new THREE.WebGLRenderer({
+  depth: true,
+  depthBuffer: true,
+  depthWrite: true,
+  depthTest: true,
+});
+
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+// Add a plane to the scene
+const planeGeometry = new THREE.PlaneGeometry(100, 100, 10, 10);
+const planeMaterial = new THREE.MeshBasicMaterial({
+  color: 0x00ff00,
+  side: THREE.DoubleSide,
+  wireframe: true,
+});
+const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+plane.rotation.x = Math.PI / 2; // Rotate the plane to be horizontal
+plane.position.y = 0; // Adjust the position of the plane
+scene.add(plane);
+console.log("pale", plane.position, plane);
+let shapes = [];
+
+const constantPlaneNormal = new THREE.Vector3(0, -1, 0);
+// //var controls = new THREE.OrbitControls( camera, renderer.domElement );
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+const circleGeometry = new THREE.CircleGeometry(30, 50); // Radius: 50, Segments: 32
+const circleMaterial = new THREE.LineBasicMaterial({
+  color: 0xff0000,
+  linewidth: 1,
+});
+const circleMesh = new THREE.LineLoop(circleGeometry, circleMaterial);
+circleMesh.rotation.x = Math.PI / 2;
+circleMesh.visible = false;
+// Add the circle to the scene
+scene.add(circleMesh);
+
+// Add radial lines to represent specific degrees
+const degrees = [0, 45, 90, 135, 180, 225, 270, 360];
+const lineMaterial = new THREE.LineBasicMaterial({ color: 0xffffff });
+
+degrees.forEach((degree) => {
+  const angleInRadians = (degree / 180) * Math.PI;
+  const x = 30 * Math.cos(angleInRadians);
+  const y = 30 * Math.sin(angleInRadians);
+
+  const lineGeometry = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0, 0, 0),
+    new THREE.Vector3(x, y, 0),
+  ]);
+
+  const line = new THREE.Line(lineGeometry, lineMaterial);
+  circleMesh.add(line);
+});
+function createPlaneMesh(center, normal, dimensions, color) {
+  const epsilon = 1e-6; // A small value to handle rounding errors
+
+  // Check if dimensions.width is close to zero
+  if (Math.abs(dimensions.width) < epsilon) {
+    // Set dimensions.width to a small positive value
+    dimensions.width = epsilon;
+  }
+
+  // Check if dimensions.height is close to zero
+  if (Math.abs(dimensions.height) < epsilon) {
+    // Set dimensions.height to a small positive value
+    dimensions.height = epsilon;
+  }
+
+  // Check if dimensions.depth is close to zero
+  if (Math.abs(dimensions.depth) < epsilon) {
+    // Set dimensions.depth to a small positive value
+    dimensions.depth = epsilon;
+  }
+
+  // If width is zero, set depth to dimensions.width
+  if (Math.abs(dimensions.width) < epsilon) {
+    dimensions.depth = dimensions.width;
+  }
+
+  // If height is zero, set depth to dimensions.height
+  if (Math.abs(dimensions.height) < epsilon) {
+    dimensions.depth = dimensions.height;
+  }
+
+  // Calculate the orientation of the plane based on the normal vector
+  const orientation = new THREE.Matrix4();
+  const up = new THREE.Vector3(0, 1, 0); // Assuming up direction is y-axis
+  orientation.lookAt(new THREE.Vector3(), normal, up);
+
+  // Create a plane geometry
+  const planeGeometry = new THREE.PlaneGeometry(
+    dimensions.width,
+    dimensions.height,
+  );
+
+  // If width is zero, set depth to dimensions.width
+  if (Math.abs(dimensions.width) < epsilon) {
+    planeGeometry.parameters.width = dimensions.depth;
+    planeGeometry.parameters.height = dimensions.height;
+  }
+
+  // If height is zero, set depth to dimensions.height
+  if (Math.abs(dimensions.height) < epsilon) {
+    planeGeometry.parameters.width = dimensions.width;
+    planeGeometry.parameters.height = dimensions.depth;
+  }
+
+  // Apply the orientation and position to the geometry
+  planeGeometry.applyMatrix4(orientation);
+  planeGeometry.translate(center.x, center.y, center.z);
+
+  // Create a material (you can customize this based on your needs)
+  const material = new THREE.MeshPhongMaterial({
+    color: color || 0xff0000,
+    side: THREE.DoubleSide,
+  });
+
+  // Create a mesh using the geometry and material
+  const planeMesh = new THREE.Mesh(planeGeometry, material);
+
+  return planeMesh;
+}
+
+//
+//const dimensions = { width: 5, height: 5 }; // Example dimensions (adjust as needed)
+const color = 0xff0000; // Red color (adjust as needed)
+let loadedModels = [];
+let meshes = null;
+let geometrys = null;
+let convexMesh = null;
+let boundingBoxMesh = null;
+let boundingboxarray = [];
+let boundingBox = null;
+let selectedMesh = null;
+let footprintMesh = null;
+const boundingBoxCenter = new THREE.Vector3();
+window.addEventListener("resize", (event) => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+window.addEventListener("mousedown", (event) => {
+  event.preventDefault();
+});
+
+let selectedFaceIndex = null;
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+document
+  .getElementById("fileInput")
+  .addEventListener("change", handleFileSelect);
+function splitGeometryToComponents(geometry) {
+  const positions = geometry.attributes.position.array;
+  const numVertices = positions.length / 3;
+
+  let indices = null;
+  if (geometry.index) {
+    indices = geometry.index.array;
+  }
+
+  const numFaces = indices ? indices.length / 3 : numVertices / 3;
+  if (numFaces <= 1) {
+    return [geometry];
+  }
+
+  // 1. Group vertices by spatial coordinates (4 decimal places to handle duplicate vertex attributes)
+  const vertexToUniqueId = new Int32Array(numVertices);
+  const coordMap = new Map();
+  let uniqueVertCount = 0;
+  for (let i = 0; i < numVertices; i++) {
+    const x = positions[i * 3];
+    const y = positions[i * 3 + 1];
+    const z = positions[i * 3 + 2];
+    const key = `${x.toFixed(4)},${y.toFixed(4)},${z.toFixed(4)}`;
+    if (coordMap.has(key)) {
+      vertexToUniqueId[i] = coordMap.get(key);
+    } else {
+      vertexToUniqueId[i] = uniqueVertCount;
+      coordMap.set(key, uniqueVertCount);
+      uniqueVertCount++;
+    }
+  }
+
+  // 2. DSU for finding connected faces
+  const parent = new Int32Array(numFaces);
+  for (let i = 0; i < numFaces; i++) parent[i] = i;
+
+  function find(i) {
+    let root = i;
+    while (parent[root] !== root) root = parent[root];
+    let curr = i;
+    while (curr !== root) {
+      let nxt = parent[curr];
+      parent[curr] = root;
+      curr = nxt;
+    }
+    return root;
+  }
+
+  function union(i, j) {
+    let rootI = find(i);
+    let rootJ = find(j);
+    if (rootI !== rootJ) {
+      parent[rootI] = rootJ;
+    }
+  }
+
+  const vertPositionToFace = new Int32Array(uniqueVertCount);
+  vertPositionToFace.fill(-1);
+
+  for (let f = 0; f < numFaces; f++) {
+    let v0, v1, v2;
+    if (indices) {
+      v0 = indices[f * 3];
+      v1 = indices[f * 3 + 1];
+      v2 = indices[f * 3 + 2];
+    } else {
+      v0 = f * 3;
+      v1 = f * 3 + 1;
+      v2 = f * 3 + 2;
+    }
+
+    const uv0 = vertexToUniqueId[v0];
+    const uv1 = vertexToUniqueId[v1];
+    const uv2 = vertexToUniqueId[v2];
+
+    const uvs = [uv0, uv1, uv2];
+    for (const uv of uvs) {
+      const otherFace = vertPositionToFace[uv];
+      if (otherFace !== -1) {
+        union(f, otherFace);
+      }
+      vertPositionToFace[uv] = f;
+    }
+  }
+
+  // Group faces by DSU root
+  const groups = new Map();
+  for (let f = 0; f < numFaces; f++) {
+    const root = find(f);
+    if (!groups.has(root)) {
+      groups.set(root, []);
+    }
+    groups.get(root).push(f);
+  }
+
+  if (groups.size <= 1) {
+    return [geometry];
+  }
+
+  const attribNames = Object.keys(geometry.attributes);
+  const resultGeometries = [];
+
+  for (const [root, faceIndices] of groups.entries()) {
+    const newGeometry = new THREE.BufferGeometry();
+    for (const name of attribNames) {
+      const attr = geometry.attributes[name];
+      const itemSize = attr.itemSize;
+      const newArray = new attr.array.constructor(faceIndices.length * 3 * itemSize);
+
+      let destIdx = 0;
+      for (const f of faceIndices) {
+        let v0, v1, v2;
+        if (indices) {
+          v0 = indices[f * 3];
+          v1 = indices[f * 3 + 1];
+          v2 = indices[f * 3 + 2];
+        } else {
+          v0 = f * 3;
+          v1 = f * 3 + 1;
+          v2 = f * 3 + 2;
+        }
+
+        const copyVert = (v) => {
+          for (let i = 0; i < itemSize; i++) {
+            newArray[destIdx++] = attr.array[v * itemSize + i];
+          }
+        };
+        copyVert(v0);
+        copyVert(v1);
+        copyVert(v2);
+      }
+      newGeometry.setAttribute(name, new THREE.BufferAttribute(newArray, itemSize));
+    }
+
+    newGeometry.computeBoundingBox();
+    newGeometry.computeVertexNormals();
+    resultGeometries.push(newGeometry);
+  }
+
+  return resultGeometries;
+}
+
+function setupSingleImportedGeometry(geometry, fileName, initialPos) {
+  const material = new THREE.MeshNormalMaterial();
+  const modelMesh = new THREE.Mesh(geometry, material);
+  modelMesh.position.copy(initialPos);
+  scene.add(modelMesh);
+
+  let footprintPoints = [];
+
+  boundingBox = new THREE.Box3().setFromObject(modelMesh);
+  boundingboxarray.push(boundingBox);
+  console.log("boundingboxarray", boundingboxarray);
+
+  // Fast 2D projected footprint calculation via C++ WebAssembly
+  console.time("2D Footprint Generation (C++ WASM)");
+  const positions = geometry.attributes.position.array;
+  const cppPoints = new wasmInstance.VectorDouble();
+  for (let i = 0; i < positions.length; i += 3) {
+    cppPoints.push_back(positions[i]);
+    cppPoints.push_back(positions[i + 2]); // X and Z
+  }
+  const cppHull = wasmInstance.convexHullFlat(cppPoints);
+  cppPoints.delete();
+
+  // Reconstruct THREE.Vector3 array from flat hull coordinates
+  for (let i = 0; i < cppHull.size(); i += 2) {
+    footprintPoints.push(
+      new THREE.Vector3(cppHull.get(i), 0, cppHull.get(i + 1)),
+    );
+  }
+  cppHull.delete();
+  console.timeEnd("2D Footprint Generation (C++ WASM)");
+
+  console.log(
+    "Generated Footprint points:",
+    footprintPoints.length,
+    footprintPoints,
+  );
+  modelMesh.userData.footprint = footprintPoints.map((point) => ({
+    x: point.x,
+    y: point.z || point.y || 0,
+  }));
+
+  // Update active globals
+  meshes = modelMesh;
+  convexMesh = null;
+  geometrys = modelMesh.geometry;
+
+  const wireframeMaterial = new THREE.MeshBasicMaterial({
+    color: 0x00ff00,
+    wireframe: true,
+  });
+  const wireframeGeometry = new THREE.BoxGeometry(
+    boundingBox.max.x - boundingBox.min.x,
+    boundingBox.max.y - boundingBox.min.y,
+    boundingBox.max.z - boundingBox.min.z,
+  );
+  const localBoundingBoxMesh = new THREE.Mesh(
+    wireframeGeometry,
+    wireframeMaterial,
+  );
+
+  boundingBox.getCenter(boundingBoxCenter);
+  localBoundingBoxMesh.position.copy(boundingBoxCenter);
+  // Add the bounding box to the scene
+  scene.add(localBoundingBoxMesh);
+  localBoundingBoxMesh.visible = false;
+  boundingBoxMesh = localBoundingBoxMesh;
+
+  modelMesh.userData = { ...modelMesh.userData, file: { name: fileName } };
+  const modelEntry = {
+    mesh: modelMesh,
+    convexMesh: null,
+    footprintMesh: null,
+    boundingBoxMesh: localBoundingBoxMesh,
+    finalMergedMesh: null,
+    largestNeighbors: null,
+  };
+  loadedModels.push(modelEntry);
+
+  updateModelHelpers(modelEntry);
+}
+
+function setupImportedGeometry(geometry, fileName) {
+  console.log("Analyzing geometry for disjoint components...");
+  const geometries = splitGeometryToComponents(geometry);
+  console.log(`Found ${geometries.length} component(s).`);
+
+  // Compute the bounding box of the entire group of components
+  const groupBounds = new THREE.Box3();
+  geometries.forEach((geom) => {
+    geom.computeBoundingBox();
+    groupBounds.union(geom.boundingBox);
+  });
+  const groupCenter = new THREE.Vector3();
+  groupBounds.getCenter(groupCenter);
+  const groupMinY = groupBounds.min.y;
+
+  geometries.forEach((geom, idx) => {
+    // 1. Compute individual component center and bottom
+    geom.computeBoundingBox();
+    const geomCenter = new THREE.Vector3();
+    geom.boundingBox.getCenter(geomCenter);
+    const geomMinY = geom.boundingBox.min.y;
+
+    // 2. Translate geometry to be centered locally around (0, 0, 0) with bottom at Y = 0
+    const dx = -geomCenter.x;
+    const dy = -geomMinY;
+    const dz = -geomCenter.z;
+    geom.translate(dx, dy, dz);
+    geom.computeBoundingBox();
+
+    // 3. Set the mesh position to align with its original relative position, offset to center the group on the bed
+    const initialPos = new THREE.Vector3(
+      geomCenter.x - groupCenter.x,
+      geomMinY - groupMinY,
+      geomCenter.z - groupCenter.z
+    );
+
+    const suffix = geometries.length > 1 ? ` (part ${idx + 1})` : "";
+    setupSingleImportedGeometry(geom, `${fileName}${suffix}`, initialPos);
+  });
+}
+
+function createSimplifiedRaycastMesh(mesh, maxTriangles = 2000) {
+  const geom = mesh.geometry;
+  if (!geom || !geom.attributes.position) return mesh;
+
+  const positions = geom.attributes.position.array;
+  const totalTriangles = positions.length / 9;
+
+  if (totalTriangles <= maxTriangles) {
+    return mesh;
+  }
+
+  const step = Math.ceil(totalTriangles / maxTriangles);
+  const simplifiedPositions = [];
+  const hasNormals = !!geom.attributes.normal;
+  const simplifiedNormals = hasNormals ? [] : null;
+  const normals = hasNormals ? geom.attributes.normal.array : null;
+
+  for (let i = 0; i < totalTriangles; i += step) {
+    const idx = i * 9;
+    for (let j = 0; j < 9; j++) {
+      simplifiedPositions.push(positions[idx + j]);
+      if (hasNormals) {
+        simplifiedNormals.push(normals[idx + j]);
+      }
+    }
+  }
+
+  const simplifiedGeom = new THREE.BufferGeometry();
+  simplifiedGeom.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array(simplifiedPositions), 3)
+  );
+  if (hasNormals) {
+    simplifiedGeom.setAttribute(
+      "normal",
+      new THREE.BufferAttribute(new Float32Array(simplifiedNormals), 3)
+    );
+  }
+  simplifiedGeom.computeBoundingSphere();
+  simplifiedGeom.computeBoundingBox();
+
+  const simplifiedMesh = new THREE.Mesh(simplifiedGeom, mesh.material);
+  simplifiedMesh.position.copy(mesh.position);
+  simplifiedMesh.rotation.copy(mesh.rotation);
+  simplifiedMesh.scale.copy(mesh.scale);
+  simplifiedMesh.updateMatrixWorld(true);
+
+  return simplifiedMesh;
+}
+
+function ensureLayflatHelpers(model) {
+  if (model.convexMesh && model.finalMergedMesh) return;
+
+  console.time("Lazy Layflat Helpers Generation");
+
+  // 1. Generate 3D Convex Hull (downsampled to max 2000 points for fast performance on complex/3MF meshes)
+  const verticess = model.mesh.geometry.attributes.position.array;
+  const totalVertices = verticess.length / 3;
+  const points = [];
+  const maxVerticesForHull = 2000;
+  const step = Math.max(1, Math.floor(totalVertices / maxVerticesForHull));
+  for (let i = 0; i < verticess.length; i += 3 * step) {
+    points.push(
+      new THREE.Vector3(verticess[i], verticess[i + 1], verticess[i + 2]),
+    );
+  }
+  const localConvexGeometry = new ConvexGeometry(points);
+  model.convexMesh = new THREE.Mesh(
+    localConvexGeometry,
+    new THREE.MeshBasicMaterial({ color: 0x00ff00, wireframe: true }),
+  );
+  model.convexMesh.position.copy(model.mesh.position);
+  model.convexMesh.rotation.copy(model.mesh.rotation);
+  scene.add(model.convexMesh);
+  model.convexMesh.visible = document.getElementById("toggleConvex").checked;
+
+  // 2. Generate Layflat Outer Faces and Highlight Mesh
+  const selectedOuterFaces = layflat.selectOuterFacesAutomatically(
+    model.convexMesh.geometry,
+  );
+  model.finalMergedMesh = selectedNeighbours(
+    model.convexMesh.geometry,
+    selectedOuterFaces,
+  );
+  if (model.finalMergedMesh) {
+    model.finalMergedMesh.position.copy(model.mesh.position);
+    model.finalMergedMesh.rotation.copy(model.mesh.rotation);
+    scene.add(model.finalMergedMesh);
+    model.finalMergedMesh.visible = false;
+  }
+
+  // 3. Raycast faces to calculate largest neighbors (using a simplified mesh to prevent browser freeze)
+  if (model.finalMergedMesh) {
+    const targetMeshForRaycast = createSimplifiedRaycastMesh(model.mesh, 2000);
+    const intersectedresults = raycastFaces(
+      model.finalMergedMesh.geometry,
+      selectedOuterFaces,
+      targetMeshForRaycast,
+      0.1,
+    );
+    model.largestNeighbors = findLargestNeighborIndex(
+      model.finalMergedMesh.geometry,
+      intersectedresults,
+    );
+    if (targetMeshForRaycast !== model.mesh) {
+      targetMeshForRaycast.geometry.dispose();
+    }
+  }
+
+  console.timeEnd("Lazy Layflat Helpers Generation");
+}
+
+function handleFileSelect(event) {
+  const file = event.target.files[0];
+  if (file) {
+    const extension = file.name.split(".").pop().toLowerCase();
+
+    if (extension === "3mf") {
+      const reader = new FileReader();
+      reader.onload = async function (e) {
+        const contents = e.target.result;
+        try {
+          console.time("3MF Load & Visualization Time");
+          const meshesFrom3mf = await parse3MF(contents);
+          meshesFrom3mf.forEach((mesh) => {
+            setupImportedGeometry(mesh.geometry, file.name);
+          });
+          console.timeEnd("3MF Load & Visualization Time");
+        } catch (err) {
+          console.timeEnd("3MF Load & Visualization Time");
+          alert("Error parsing 3MF model with WASM library: " + err.message);
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    } else {
+      const loader = new STLLoader();
+      console.time("STL Load & Visualization Time");
+      loader.load(URL.createObjectURL(file), function (geometry) {
+        setupImportedGeometry(geometry, file.name);
+        console.timeEnd("STL Load & Visualization Time");
+      });
+    }
+    fileInput.value = "";
+  }
+}
+
+function computePolygonArea(mesh) {
+  // Extract vertices from the mesh geometry
+  const vertices = mesh.geometry.attributes.position.array;
+  const hullPoints = [];
+
+  // Assuming the vertices are in the format [x1, y1, z1, x2, y2, z2, ...]
+  for (let i = 0; i < vertices.length; i += 3) {
+    hullPoints.push({ x: vertices[i], y: vertices[i + 1] });
+  }
+
+  // Compute area using the shoelace formula
+  let area = 0;
+  console.log("hullPoints", hullPoints);
+  for (let i = 0; i < hullPoints.length; i++) {
+    const j = (i + 1) % hullPoints.length;
+    area += hullPoints[i].x * hullPoints[j].y;
+    area -= hullPoints[j].x * hullPoints[i].y;
+  }
+  area = Math.abs(area) / 2;
+  return area;
+}
+
+// Handle mesh cloning
+// document.getElementById('cloneButton').addEventListener('click', function () {
+//     if (selectedMesh) {
+//         const clonedMesh = selectedMesh.clone();
+//         clonedMesh.position.x += 2;
+//         scene.add(clonedMesh);
+//     }
+// });
+document.getElementById("Autoplace").addEventListener("click", function () {
+  autoplace(finalMergedMesh, meshes, largestNeighbors);
+});
+
+function createPlaneGeometry(area) {
+  // Remove any existing plane to avoid multiple planes being added
+  const existingPlane = scene.getObjectByName("placementPlane");
+  if (existingPlane) {
+    scene.remove(existingPlane);
+  }
+
+  const planeSize = area / 30; // Determine size based on area
+  console.log("planesize", planeSize);
+  const planeGeometry = new THREE.PlaneGeometry(planeSize, planeSize, 10, 10);
+  const planeMaterial = new THREE.MeshBasicMaterial({
+    color: 0x00ff00,
+    side: THREE.DoubleSide,
+  });
+  const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+  plane.rotation.x = Math.PI / 2; // Rotate the plane to be horizontal
+  plane.position.y = 0; // Adjust the position of the plane
+  plane.name = "placementPlane"; // Name the plane for easy removal next time
+  scene.add(plane);
+}
+
+// Handle mouse click to select face
+// window.removeEventListener('click', onMouseClick);
+// Add the click event listener
+// window.addEventListener('click', onMouseClick, false);
+
+function onMouseClick(event) {
+  event.preventDefault();
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObject(finalMergedMesh);
+
+  if (intersects.length > 0) {
+    selectedFaceIndex = intersects[0].faceIndex;
+    console.log("Selected Face Index:", selectedFaceIndex);
+    //    findAllNeighboringFaces(geometrys, selectedFaceIndex);
+
+    var neigbourface = findAllNeighboringFaces(
+      finalMergedMesh.geometry,
+      selectedFaceIndex,
+    );
+    console.log("facess", neigbourface);
+
+    const selectedFaceNormal = getFaceNormal(
+      finalMergedMesh.geometry,
+      selectedFaceIndex,
+    );
+
+    //const filteredNormals = filterNormalsBySelectedFace(geometrys, selectedFaceNormal, neigbourface);
+    //  console.log('Filtered Normals:', filteredNormals);
+    // highlightFilteredNormalss(geometrys, selectedFaceIndex, neigbourface);
+    const normalss = getFaceNormal(finalMergedMesh.geometry, selectedFaceIndex);
+    const angless = isAngleInSet(normalss, angleSet);
+    console.log("angles", angless);
+  }
+}
+
+function isOuterFace(geometry, flatfaces, mesh) {
+  const facesToRemove = [];
+
+  // Loop through the flatfaces object
+  for (const angles in flatfaces) {
+    for (const direction in flatfaces[angles]) {
+      const entries = flatfaces[angles][direction];
+
+      // Loop through the normals and face indices for each direction entry
+      for (let i = 0; i < entries.normals.length; i++) {
+        const faceNormal = entries.normals[i];
+        const centroid = calculateFaceCentroid(
+          geometry,
+          entries.faceIndices[i],
+        );
+
+        const raycaster = new THREE.Raycaster(centroid, faceNormal);
+        const intersections = raycaster.intersectObject(mesh);
+
+        // If no intersections, it's likely an outer face
+        if (intersections.length === 0) {
+          facesToRemove.push(entries.faceIndices[i]);
+        }
+      }
+    }
+  }
+
+  return facesToRemove;
+}
+
+function calculateFaceCentroid(geometry, faceIndex) {
+  const faceVertices = getFaceVerticx(geometry, faceIndex);
+
+  // Use the faceVertices array directly
+  const center = calculateFaceCenter(faceVertices);
+
+  return center;
+}
+function getProjectedVertices(geometry) {
+  const positions = geometry.attributes.position.array;
+  const projectedVertices = [];
+
+  for (let i = 0; i < positions.length; i += 3) {
+    // Project onto the XZ plane (ignore Y coordinate)
+    projectedVertices.push(new THREE.Vector2(positions[i], positions[i + 2]));
+  }
+
+  return projectedVertices;
+}
+
+function computeConvexHull(points) {
+  return convexHull(points);
+}
+
+function cross(o, a, b) {
+  return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+}
+
+function visualizeConvexHull(hullPoints) {
+  // Create a Shape from the hull points
+  const shape = new THREE.Shape();
+  shape.moveTo(hullPoints[0].x, hullPoints[0].y);
+
+  for (let i = 1; i < hullPoints.length; i++) {
+    shape.lineTo(hullPoints[i].x, hullPoints[i].y);
+  }
+
+  shape.lineTo(hullPoints[0].x, hullPoints[0].y); // Close the shape
+
+  // Create a ShapeGeometry from the shape
+  const geometry = new THREE.ShapeGeometry(shape);
+
+  // Create a material and mesh
+  const material = new THREE.MeshBasicMaterial({
+    color: 0xff0000,
+    wireframe: true,
+  });
+  const mesh = new THREE.Mesh(geometry, material);
+
+  // Rotate to align with the XZ plane
+  mesh.rotation.x = Math.PI / 2;
+
+  // Add the mesh to the scene
+  scene.add(mesh);
+  shapes.push(mesh); // Assuming shapes is an array to keep track of added shapes
+
+  console.log("shape in the bin", shapes);
+}
+
+function arrangeBoundingBoxes(boundingBoxArray) {
+  let planeWidth = 0;
+  let planeHeight = 0;
+  let currentRowWidth = 0;
+  let currentRowHeight = 0;
+  let widthside = true; // Flag to alternate between width and height increase
+  let maxrowwidth = 0;
+  let maxrowheight = 0;
+  let increasewidth = 0;
+
+  boundingBoxArray.forEach((box, index) => {
+    const boxWidth = box.max.x - box.min.x;
+    const boxHeight = box.max.z - box.min.z;
+
+    console.log(
+      `Processing box ${index + 1}: Width = ${boxWidth}, Height = ${boxHeight}`,
+    );
+
+    if (widthside) {
+      if (currentRowWidth + boxWidth > planeWidth) {
+        // Start a new row
+        maxrowheight = Math.max(maxrowheight, boxHeight);
+        maxrowwidth = Math.max(maxrowwidth, boxWidth);
+        //  currentRowWidth += boxWidth;
+
+        currentRowHeight = maxrowheight;
+
+        widthside = false;
+        planeWidth += boxWidth;
+      } else {
+        // Continue in the current row
+        // currentRowWidth += boxWidth;
+        if (boxWidth + currentRowWidth > planeWidth) {
+          increasewidth = boxWidth + currentRowWidth - planeWidth;
+          planeWidth += increasewidth;
+          console.log("this increasing");
+        }
+        //  planeWidth=currentRowWidth;
+        // currentRowHeight = Math.max(currentRowHeight, boxHeight);
+        widthside = false;
+      }
+      // Update plane width to the maximum row width encountered
+
+      if (planeHeight == 0) {
+        currentRowHeight = boxHeight;
+      }
+      planeHeight = Math.max(planeHeight, currentRowHeight);
+    } else {
+      if (currentRowHeight + boxHeight > planeHeight) {
+        // Start a new column
+
+        maxrowheight = Math.max(maxrowheight, boxHeight);
+        maxrowwidth = Math.max(maxrowwidth, boxWidth);
+        //  planeWidth += currentRowWidth;
+        currentRowWidth = maxrowwidth;
+        //  currentRowHeight += boxHeight;
+        widthside = true;
+      } else {
+        if (boxWidth + currentRowWidth > planeWidth) {
+          console.log("this increasing", increasewidth, planeWidth, boxWidth);
+          increasewidth = boxWidth + currentRowWidth - planeWidth;
+          planeWidth += increasewidth;
+          // console.log("this increasing",increasewidth);
+        }
+        planeHeight = currentRowHeight;
+        widthside = true;
+      }
+      // Update plane height to the maximum column height encountered
+      planeHeight += boxHeight;
+    }
+
+    // Log the current state after adding each box
+    console.log(`After box ${index + 1}:`);
+    console.log(
+      `Current Row Width = ${currentRowWidth}, Current Row Height = ${currentRowHeight}`,
+    );
+    console.log(`Plane Width = ${planeWidth}, Plane Height = ${planeHeight}`);
+
+    // Alternate the arrangement direction
+    // widthside = !widthside;
+  });
+
+  // // Final adjustments to ensure the plane dimensions are correct
+  // if (widthside) {
+  //     planeHeight += currentRowHeight;
+  // } else {
+  //     planeWidth += currentRowWidth;
+  // }
+
+  console.log(
+    `Final Plane Dimensions: Width = ${planeWidth}, Height = ${planeHeight}`,
+  );
+  return { width: planeWidth, height: planeHeight };
+}
+
+// Example usage:
+
+// Example usage:
+
+function isAngleInSet(normal, angleSet) {
+  // Ensure the normal vector is normalized
+  const length = Math.sqrt(normal.x ** 2 + normal.y ** 2 + normal.z ** 2);
+  const normalizedNormal = {
+    x: normal.x / length,
+    y: normal.y / length,
+    z: normal.z / length,
+  };
+
+  // Calculate the angle in radians using atan2, considering all three components
+  const angle = Math.atan2(
+    normalizedNormal.y,
+    normalizedNormal.x,
+    normalizedNormal.z,
+  );
+
+  // Convert the angle to degrees and ensure it's within [0, 360] degrees
+  let degrees = (angle * 180) / Math.PI;
+
+  degrees = (degrees + 360) % 360;
+  // console.log("degree",degrees);
+
+  // Adjust for negative angles
+  if (degrees < 0) {
+    degrees += 360;
+  }
+
+  // Round the angle to the nearest integer
+  degrees = Math.round(degrees);
+
+  const isInSet = angleSet.includes(degrees);
+
+  return { angle: degrees, isInSet };
+}
+
+const angleSet = [0, 45, 90, 70, 135, 180, 225, 270, 360, 315];
+
+// Usage
+
+function findAllNeighboringFaces(geometry, selectedFaceIndex) {
+  const faces = geometry.attributes.position.count / 3;
+  const neighbors = [];
+  const selectedVertices = getFaceVertices(geometry, selectedFaceIndex);
+
+  for (let i = 0; i < faces; i++) {
+    if (i !== selectedFaceIndex) {
+      const vertices = getFaceVertices(geometry, i);
+      if (areVerticesInSamePlane(selectedVertices, vertices)) {
+        neighbors.push(i);
+      }
+    }
+  }
+
+  // console.log("neighbours", neighbors);
+  return neighbors;
+}
+let isDragging = false;
+let isrotating = false;
+
+// Offset between intersection point and click position
+const dragOffset = new THREE.Vector3();
+
+let isRotationEventAttached = false;
+
+document
+  .getElementById("rotationButton")
+  .addEventListener("click", function () {
+    if (!isRotationEventAttached) {
+      document.addEventListener("mousedown", onMouseDown);
+      document.addEventListener("mousemove", onMouseMove);
+      document.addEventListener("mouseup", onMouseUp);
+      isRotationEventAttached = true;
+      circleMesh.visible = true;
+    } else {
+      document.removeEventListener("mousedown", onMouseDown);
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+      isRotationEventAttached = false;
+      circleMesh.visible = false;
+    }
+  });
+
+let previousMousePosition = {
+  x: 0,
+  y: 0,
+};
+// Disable OrbitControls on mousedown if ray intersects the mesh
+function onMouseDown(event) {
+  event.preventDefault();
+
+  // Set mouse coordinates
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+  // Update the raycaster
+  raycaster.setFromCamera(mouse, camera);
+
+  // Check for intersections
+  const intersects = raycaster.intersectObject(boundingBoxMesh);
+
+  if (intersects.length > 0) {
+    isrotating = true;
+    isDragging = false;
+
+    // Calculate the offset between intersection point and click position
+    dragOffset.copy(intersects[0].point).sub(meshes.position);
+    meshes.verticesNeedUpdate = true;
+    meshes.normalsNeedUpdate = true;
+
+    meshes.updateMatrixWorld();
+
+    // Disable OrbitControls
+  }
+}
+
+const rotationAxis = new THREE.Vector3(0, 1, 0);
+// Move the mesh on mousemove if dragging
+function onMouseMove(event) {
+  event.preventDefault();
+
+  if (isrotating) {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    raycaster.setFromCamera(mouse, camera);
+
+    const intersects = raycaster.intersectObject(boundingBoxMesh);
+
+    const deltaX = mouse.x - previousMousePosition.x;
+    const angle = deltaX * 10;
+
+    boundingBoxMesh.rotateOnWorldAxis(rotationAxis, angle);
+
+    boundingBox.setFromObject(boundingBoxMesh);
+    boundingBox.getCenter(boundingBoxCenter);
+    createAxesLines(boundingBoxMesh);
+    circleMesh.position.copy(boundingBoxCenter);
+
+    // Update the rotation of the mesh to match the bounding box
+    //  mesh.rotation.copy(boundingBoxMesh.rotation);
+
+    meshes.rotation.copy(boundingBoxMesh.rotation);
+
+    const model = loadedModels.find((m) => m.mesh === meshes);
+    if (model) {
+      if (model.finalMergedMesh) {
+        model.finalMergedMesh.rotation.copy(meshes.rotation);
+        model.finalMergedMesh.updateMatrixWorld();
+      }
+      if (model.convexMesh) {
+        model.convexMesh.rotation.copy(meshes.rotation);
+        model.convexMesh.updateMatrixWorld();
+      }
+      if (model.footprintMesh) {
+        // Update footprint rotation using YXZ order (rotation.y maps to world Y axis rotation)
+        model.footprintMesh.rotation.y = meshes.rotation.y;
+        model.footprintMesh.rotation.z = 0;
+        model.footprintMesh.updateMatrixWorld();
+      }
+    }
+
+    previousMousePosition = { x: mouse.x, y: mouse.y };
+  }
+}
+
+// Enable OrbitControls on mouseup
+function onMouseUp() {
+  isrotating = false;
+  if (geometrys) {
+    geometrys.verticesNeedUpdate = true;
+    geometrys.normalsNeedUpdate = true;
+  }
+  if (convexMesh) {
+    if (convexMesh.geometry) convexMesh.geometry.verticesNeedUpdate = true;
+    convexMesh.normalsNeedUpdate = true;
+    convexMesh.updateMatrixWorld();
+  }
+  if (finalMergedMesh) {
+    if (finalMergedMesh.geometry) {
+      finalMergedMesh.geometry.verticesNeedUpdate = true;
+      finalMergedMesh.geometry.normalsNeedUpdate = true;
+    }
+    finalMergedMesh.updateMatrixWorld();
+  }
+
+  if (meshes) {
+    meshes.updateMatrixWorld();
+    if (boundingBox && boundingBoxMesh) {
+      boundingBox.setFromObject(meshes);
+      boundingBox.getCenter(boundingBoxCenter);
+      boundingBoxMesh.position.copy(boundingBoxCenter);
+      boundingBoxMesh.rotation.copy(meshes.rotation);
+    }
+  }
+
+  // Enable OrbitControls
+  controls.enabled = true;
+}
+
+document.addEventListener("mousedown", onobject);
+document.addEventListener("mousemove", onobjectmove);
+document.addEventListener("mouseup", onup);
+
+function onobject(event) {
+  // If layflat event handler is active, do not allow dragging.
+  // Instead, clicking should only update the active selection and overlay.
+  if (isMouseDownEventAttached) {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+    raycaster.setFromCamera(mouse, camera);
+
+    const targets = loadedModels.map((m) => m.mesh).filter(Boolean);
+    const intersects = raycaster.intersectObjects(targets);
+    if (intersects.length > 0) {
+      const hitMesh = intersects[0].object;
+      const model = loadedModels.find((m) => m.mesh === hitMesh);
+      if (model) {
+        meshes = model.mesh;
+        selectedMesh = model.mesh;
+        convexMesh = model.convexMesh || null;
+        footprintMesh = model.footprintMesh || null;
+        boundingBoxMesh = model.boundingBoxMesh || null;
+        geometrys = model.mesh.geometry;
+        finalMergedMesh = model.finalMergedMesh || null;
+        boundingBox = new THREE.Box3().setFromObject(meshes);
+
+        // Toggle overlays
+        loadedModels.forEach((m) => {
+          if (m.finalMergedMesh) {
+            m.finalMergedMesh.visible = m.mesh === meshes;
+          }
+          if (m.mesh) {
+            m.mesh.visible = true; // Keep original meshes visible
+          }
+        });
+      }
+    }
+    return;
+  }
+
+  // Set mouse coordinates
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+  // Update the raycaster
+  raycaster.setFromCamera(mouse, camera);
+
+  // Check for intersections with all loaded models
+  const targets = loadedModels.map((m) => m.mesh).filter(Boolean);
+  const intersects = raycaster.intersectObjects(targets);
+
+  if (intersects.length > 0) {
+    isDragging = true;
+
+    // Find which model was clicked
+    const hitMesh = intersects[0].object;
+    const model = loadedModels.find((m) => m.mesh === hitMesh);
+    if (model) {
+      // Update active globals
+      meshes = model.mesh;
+      selectedMesh = model.mesh;
+      convexMesh = model.convexMesh || null;
+      footprintMesh = model.footprintMesh || null;
+      boundingBoxMesh = model.boundingBoxMesh || null;
+      geometrys = model.mesh.geometry;
+      finalMergedMesh = model.finalMergedMesh || null;
+      boundingBox = new THREE.Box3().setFromObject(meshes);
+
+      // Calculate drag offset
+      dragOffset.copy(intersects[0].point).sub(meshes.position);
+
+      // Draw coordinate axes on the selected mesh
+      createAxesLines(meshes);
+
+      // If in layflat mode, update the visible face highlight overlays dynamically to match the selection
+      if (isMouseDownEventAttached) {
+        loadedModels.forEach((m) => {
+          if (m.finalMergedMesh) {
+            m.finalMergedMesh.visible = m.mesh === meshes;
+          }
+        });
+      }
+    }
+
+    // Disable OrbitControls if dragging
+    if (isDragging) {
+      controls.enabled = false;
+    }
+  }
+}
+
+// Move the mesh on mousemove if dragging
+function onobjectmove(event) {
+  event.preventDefault();
+
+  if (isDragging) {
+    // Update the mouse coordinates
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    // Update the raycaster
+    raycaster.setFromCamera(mouse, camera);
+
+    // Raycast to find the intersection point
+    const intersects = raycaster.intersectObject(meshes);
+
+    if (intersects.length > 0) {
+      // Calculate the new position
+      const newX = intersects[0].point.x - dragOffset.x;
+      const newZ = intersects[0].point.z - dragOffset.z;
+      console.log("Before update:", meshes.geometry);
+      // Restrict the movement within the plane boundaries
+      const halfPlaneSize = 50; // Assuming the plane size is 200x200
+      meshes.position.x = THREE.MathUtils.clamp(
+        newX,
+        -halfPlaneSize,
+        halfPlaneSize,
+      );
+      meshes.position.z = THREE.MathUtils.clamp(
+        newZ,
+        -halfPlaneSize,
+        halfPlaneSize,
+      );
+
+      // Update the geometry and bounding box
+      geometrys.verticesNeedUpdate = true;
+      geometrys.normalsNeedUpdate = true;
+      geometrys.positionNeedUpdate = true;
+
+      const model = loadedModels.find((m) => m.mesh === meshes);
+      if (model) {
+        if (model.convexMesh) {
+          model.convexMesh.position.copy(meshes.position);
+          model.convexMesh.updateMatrixWorld();
+        }
+        if (model.finalMergedMesh) {
+          model.finalMergedMesh.position.copy(meshes.position);
+          model.finalMergedMesh.updateMatrixWorld();
+          model.finalMergedMesh.geometry.attributes.position.needsUpdate = true;
+          model.finalMergedMesh.geometry.computeVertexNormals();
+        }
+        if (model.footprintMesh) {
+          model.footprintMesh.position.x = meshes.position.x;
+          model.footprintMesh.position.z = meshes.position.z;
+          model.footprintMesh.updateMatrixWorld();
+        }
+        if (model.boundingBoxMesh) {
+          boundingBox.setFromObject(meshes);
+          boundingBox.getCenter(boundingBoxCenter);
+          model.boundingBoxMesh.position.copy(boundingBoxCenter);
+          model.boundingBoxMesh.updateMatrixWorld();
+        }
+      }
+      meshes.updateMatrixWorld();
+      meshes.geometry.verticesNeedUpdate = true;
+      meshes.geometry.normalsNeedUpdate = true;
+      meshes.geometry.positionNeedUpdate = true;
+      // Update the geometry and bounding box
+      if (
+        finalMergedMesh &&
+        finalMergedMesh.geometry &&
+        finalMergedMesh.geometry.attributes.position
+      ) {
+        finalMergedMesh.geometry.attributes.position.needsUpdate = true;
+        finalMergedMesh.geometry.computeVertexNormals(); // Optional: Update normals
+      }
+
+      console.log("After update:", meshes.geometry.attributes.position);
+      createAxesLines(meshes);
+    }
+  }
+}
+// Create a circle geometry
+
+// Enable OrbitControls on mouseup
+function onup() {
+  isDragging = false;
+  //  meshes.verticesNeedUpdate=true
+  //  meshes.normalsNeedUpdate=true;
+  if (meshes && boundingBox && boundingBoxMesh) {
+    boundingBox.setFromObject(meshes);
+    boundingBox.getCenter(boundingBoxCenter);
+    boundingBoxMesh.position.copy(boundingBoxCenter);
+  }
+
+  if (meshes) {
+    meshes.updateMatrixWorld();
+    if (meshes.geometry) {
+      meshes.geometry.verticesNeedUpdate = true;
+      meshes.geometry.normalsNeedUpdate = true;
+      meshes.geometry.positionNeedUpdate = true;
+    }
+  }
+
+  if (finalMergedMesh) {
+    finalMergedMesh.updateMatrixWorld();
+    if (finalMergedMesh.geometry) {
+      finalMergedMesh.geometry.verticesNeedUpdate = true;
+      finalMergedMesh.geometry.normalsNeedUpdate = true;
+    }
+  }
+
+  // Enable OrbitControls
+  controls.enabled = true;
+}
+
+//  highlightFilteredNormals(geometry, 33, neigbourfacesss  );
+
+function areVerticesInSamePlane(vertices1, vertices2) {
+  const threshold = 0.001; // Adjust the threshold based on your model
+  const plane = new THREE.Plane().setFromCoplanarPoints(
+    vertices1[0],
+    vertices1[1],
+    vertices1[2],
+  );
+  return vertices2.every(
+    (vertex) => Math.abs(plane.distanceToPoint(vertex)) < threshold,
+  );
+}
+
+// Function to get the vertices of a face
+function getFaceVertices(geometry, faceIndex) {
+  const positions = geometry.attributes.position.array;
+  const startIndex = faceIndex * 9;
+  return [
+    new THREE.Vector3(
+      positions[startIndex],
+      positions[startIndex + 1],
+      positions[startIndex + 2],
+    ),
+    new THREE.Vector3(
+      positions[startIndex + 3],
+      positions[startIndex + 4],
+      positions[startIndex + 5],
+    ),
+    new THREE.Vector3(
+      positions[startIndex + 6],
+      positions[startIndex + 7],
+      positions[startIndex + 8],
+    ),
+  ];
+}
+
+const mergedPositions = [];
+
+let mergedMesh = null;
+let mergedarraynormals = [];
+let mergedarray = [];
+
+function highlightFilteredNormalss(
+  geometry,
+  selectedFaceIndex,
+  filteredNormals,
+) {
+  const positions = geometry.attributes.position.array;
+  const normals = geometry.attributes.normal.array;
+
+  let mergedNormals = [];
+  // createAxesLines(meshes);
+
+  // Add the selected face to the merged geometry
+  const selectedFaceStart = selectedFaceIndex * 9;
+  const selectedFaceEnd = selectedFaceStart + 9;
+  mergedPositions.push(...positions.slice(selectedFaceStart, selectedFaceEnd));
+  mergedNormals.push(...normals.slice(selectedFaceStart, selectedFaceEnd));
+
+  // Extract positions and normals of selected and filtered neighboring faces
+  filteredNormals.forEach((faceIndex) => {
+    const startIndex = faceIndex * 9;
+    const endIndex = startIndex + 9;
+
+    const facePositions = positions.slice(startIndex, endIndex);
+    const faceNormals = normals.slice(startIndex, endIndex);
+
+    if (!containsNaN(facePositions) && !containsNaN(faceNormals)) {
+      mergedPositions.push(...facePositions);
+      mergedNormals.push(...faceNormals);
+    }
+  });
+
+  // Create a new BufferGeometry for the merged faces
+  const mergedGeometry = new THREE.BufferGeometry();
+  mergedGeometry.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array(mergedPositions), 3),
+  );
+  mergedGeometry.setAttribute(
+    "normal",
+    new THREE.BufferAttribute(new Float32Array(mergedNormals), 3),
+  );
+
+  // Calculate a single normal for the merged faces
+
+  // Create a mesh with the merged geometry
+  const mergedMaterial = new THREE.MeshBasicMaterial({
+    color: 0xff0000,
+    wireframe: true,
+  });
+  mergedMesh = new THREE.Mesh(mergedGeometry, mergedMaterial);
+
+  // Add the merged mesh to the scene
+  scene.add(mergedMesh);
+
+  mergedarray.push(mergedMesh);
+  mergedarraynormals.push(mergedNormals);
+
+  let maxLength = 0;
+  let longestMeshIndex = -1;
+
+  for (let i = 0; i < mergedarray.length; i++) {
+    const normalsArray = mergedarray[i].geometry.getAttribute("normal").array;
+    //  console.log(`Normals for Mesh ${i + 1}:`, normalsArray.length);
+    let normils = normalsArray[i];
+    //  console.log("normils", normils);
+    normalSum = new THREE.Vector3(); // Initialize outside the loop to accumulate all normals
+
+    for (let i = 0; i < mergedarray.length; i++) {
+      const normalsArray = mergedarray[i].geometry.getAttribute("normal").array;
+      // console.log(`Normals for Mesh ${i + 1}:`, normalsArray.length);
+
+      // Sum up all normals
+      for (let j = 0; j < normalsArray.length; j += 3) {
+        const normal = new THREE.Vector3(
+          normalsArray[j],
+          normalsArray[j + 1],
+          normalsArray[j + 2],
+        );
+        normalSum.add(normal);
+      }
+
+      if (normalsArray.length > maxLength) {
+        maxLength = normalsArray.length;
+        longestMeshIndex = i;
+      }
+    }
+
+    // console.log(`Mesh with the longest normals is at index ${longestMeshIndex} with length ${maxLength}`);
+
+    // Normalize the sum to get the average normal
+    normalSum.normalize();
+    //console.log("Combined Face Normal:", normalSum);
+  }
+}
+function mergeGeometries(geometries) {
+  const mergedGeometry = new THREE.BufferGeometry();
+
+  // Merge position attributes
+  const positionArrays = geometries.map(
+    (geometry) => geometry.getAttribute("position").array,
+  );
+  const mergedPositionArray = new Float32Array(
+    positionArrays.reduce((acc, arr) => acc.concat(Array.from(arr)), []),
+  );
+  mergedGeometry.setAttribute(
+    "position",
+    new THREE.BufferAttribute(mergedPositionArray, 3),
+  );
+
+  // Merge normal attributes
+  const normalArrays = geometries.map(
+    (geometry) => geometry.getAttribute("normal").array,
+  );
+  const mergedNormalArray = new Float32Array(
+    normalArrays.reduce((acc, arr) => acc.concat(Array.from(arr)), []),
+  );
+  mergedGeometry.setAttribute(
+    "normal",
+    new THREE.BufferAttribute(mergedNormalArray, 3),
+  );
+
+  return mergedGeometry;
+}
+function mergeGeometriesWithGroups(geometries, materials) {
+  const mergedGeometry = new THREE.BufferGeometry();
+
+  const positionArrays = [];
+  const normalArrays = [];
+  const groups = [];
+
+  let vertexOffset = 0;
+
+  // Extract attributes and groups from each geometry
+  geometries.forEach((geometry, index) => {
+    const positions = geometry.getAttribute("position").array;
+    const normals = geometry.getAttribute("normal").array;
+    const material = materials[index];
+
+    // Calculate the number of vertices in the geometry
+    const numVertices = positions.length / 3;
+
+    // Create a group for the current geometry
+    groups.push({
+      start: vertexOffset,
+      count: numVertices,
+      materialIndex: index,
+    });
+
+    // Increment the vertex offset for the next geometry
+    vertexOffset += numVertices;
+
+    positionArrays.push(positions);
+    normalArrays.push(normals);
+  });
+
+  // Merge position attributes
+  const mergedPositionArray = new Float32Array(
+    positionArrays.reduce((acc, arr) => acc.concat(Array.from(arr)), []),
+  );
+  mergedGeometry.setAttribute(
+    "position",
+    new THREE.BufferAttribute(mergedPositionArray, 3),
+  );
+
+  // Merge normal attributes
+  const mergedNormalArray = new Float32Array(
+    normalArrays.reduce((acc, arr) => acc.concat(Array.from(arr)), []),
+  );
+  mergedGeometry.setAttribute(
+    "normal",
+    new THREE.BufferAttribute(mergedNormalArray, 3),
+  );
+
+  // Set groups in the merged geometry
+  mergedGeometry.groups = groups;
+
+  return mergedGeometry;
+}
+
+function mergeMeshes(meshes) {
+  const geometries = meshes.map((mesh) => mesh.geometry);
+  const materials = meshes.map((mesh) => new THREE.MeshBasicMaterial()); // You can customize material creation if needed
+  const mergedGeometry = mergeGeometriesWithGroups(geometries, materials);
+
+  // If you want to use a single material for the entire merged mesh, you can use the following:
+  // const mergedMaterial = new THREE.MeshBasicMaterial({
+  //     color: 0xffffff,
+  //     transparent: true,
+  //     opacity: 0.5,
+  //     depthWrite: false,
+  //     polygonOffset: true,
+  //     polygonOffsetFactor: -2,
+  //     polygonOffsetUnits: -2,
+  // });
+
+  // If you want to use different materials for each group, you can use the following:
+  const mergedMaterials = materials.map(
+    (material) =>
+      new THREE.MeshBasicMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.5,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -2,
+      }),
+  ); // Customize material creation if needed
+  const mergedMesh = new THREE.Mesh(mergedGeometry, mergedMaterials);
+
+  return mergedMesh;
+}
+
+function insetGeometry(geometry, insetAmount) {
+  const positions = geometry.attributes.position.array;
+
+  for (let i = 0; i < positions.length; i += 9) {
+    // Calculate the face center
+    const centerX = (positions[i] + positions[i + 3] + positions[i + 6]) / 3;
+    const centerY =
+      (positions[i + 1] + positions[i + 4] + positions[i + 7]) / 3;
+    const centerZ =
+      (positions[i + 2] + positions[i + 5] + positions[i + 8]) / 3;
+
+    // Move the vertices of the face inward to achieve the inset effect
+    for (let j = 0; j < 9; j += 3) {
+      positions[i + j] += Math.min(
+        (centerX - positions[i + j]) * insetAmount,
+        0.5,
+      );
+      positions[i + j + 1] += Math.min(
+        (centerY - positions[i + j + 1]) * insetAmount,
+        0.5,
+      );
+      positions[i + j + 2] += Math.min(
+        (centerZ - positions[i + j + 2]) * insetAmount,
+        0.5,
+      );
+    }
+  }
+
+  // Update the attributes of the geometry
+  geometry.attributes.position.needsUpdate = true;
+  // geometry.computeFaceNormals();
+  // geometry.computeVertexNormals();
+}
+
+function highlightFilteredNormals(
+  geometry,
+  selectedFaceIndex,
+  filteredNormals,
+  mergedMesh,
+) {
+  const positions = geometry.attributes.position.array;
+  const normals = geometry.attributes.normal.array;
+
+  const geometries = [];
+  const materials = [];
+
+  // Add the selected face geometry
+  const selectedFaceStart = selectedFaceIndex * 9;
+  const selectedFaceEnd = selectedFaceStart + 9;
+  const selectedFaceGeometry = new THREE.BufferGeometry();
+  selectedFaceGeometry.setAttribute(
+    "position",
+    new THREE.BufferAttribute(
+      positions.slice(selectedFaceStart, selectedFaceEnd),
+      3,
+    ),
+  );
+  selectedFaceGeometry.setAttribute(
+    "normal",
+    new THREE.BufferAttribute(
+      normals.slice(selectedFaceStart, selectedFaceEnd),
+      3,
+    ),
+  );
+  geometries.push(selectedFaceGeometry);
+
+  // Create a new material for the selected face
+  const selectedMaterial = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.5,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
+  });
+  materials.push(selectedMaterial);
+
+  // Apply inset effect to the selected face
+  insetGeometry(selectedFaceGeometry, 0.05);
+
+  // Add filtered faces geometries
+  filteredNormals.forEach((faceIndex) => {
+    const startIndex = faceIndex * 9;
+    const endIndex = startIndex + 9;
+
+    const faceGeometry = new THREE.BufferGeometry();
+    faceGeometry.setAttribute(
+      "position",
+      new THREE.BufferAttribute(positions.slice(startIndex, endIndex), 3),
+    );
+    faceGeometry.setAttribute(
+      "normal",
+      new THREE.BufferAttribute(normals.slice(startIndex, endIndex), 3),
+    );
+
+    if (
+      !containsNaN(faceGeometry.attributes.position.array) &&
+      !containsNaN(faceGeometry.attributes.normal.array)
+    ) {
+      // Apply inset effect to each face individually
+      insetGeometry(faceGeometry, 0.05);
+      geometries.push(faceGeometry);
+
+      // Create a new material for each filtered face
+      const filteredMaterial = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        transparent: true,
+        opacity: 0.05,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
+      });
+      materials.push(filteredMaterial);
+    }
+  });
+
+  // Merge all geometries into a single geometry
+  const mergedGeometry = mergeGeometries(geometries);
+
+  // Create a new mesh with the merged geometry and inset effect
+  const mergedMeshMaterial = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.5,
+    depthWrite: false,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
+  });
+  const mergedMeshWithInset = new THREE.Mesh(mergedGeometry, materials);
+
+  // Set material indices for the selected face and filtered faces
+  setMaterialIndices(mergedMeshWithInset, selectedFaceIndex, filteredNormals);
+
+  mergedMesh.push(mergedMeshWithInset);
+}
+
+function setMaterialIndices(mesh, selectedFaceIndex, filteredNormals) {
+  const indices = new Float32Array(mesh.geometry.attributes.position.count);
+
+  // Set material index for the selected face
+  for (
+    let i = selectedFaceIndex * 3 * 3;
+    i < (selectedFaceIndex + 1) * 3 * 3;
+    i += 3
+  ) {
+    indices[i] = 0;
+    indices[i + 1] = 0;
+    indices[i + 2] = 0;
+  }
+
+  // Set material indices for the filtered faces
+  filteredNormals.forEach((faceIndex, index) => {
+    for (let i = faceIndex * 3 * 3; i < (faceIndex + 1) * 3 * 3; i += 3) {
+      indices[i] = index + 1;
+      indices[i + 1] = index + 1;
+      indices[i + 2] = index + 1;
+    }
+  });
+
+  mesh.geometry.setAttribute(
+    "materialIndex",
+    new THREE.BufferAttribute(indices, 1),
+  );
+}
+
+// Usage
+
+let normalSum = null;
+let isMouseDownEventAttached = false;
+
+let translationApplied = false;
+function applyTranslationToObject(object) {
+  // Extract the current position components from the object
+  const currentX = object.position.x;
+  const currentY = object.position.y;
+  const currentZ = object.position.z;
+
+  // Extract the translation components from the object's matrix
+  const translationMatrix = new THREE.Matrix4().copy(object.matrix);
+  const translation = new THREE.Vector3();
+  translationMatrix.decompose(
+    new THREE.Vector3(),
+    new THREE.Quaternion(),
+    translation,
+  );
+
+  // Apply the translation to the geometry's position attribute directly
+  const positionAttribute = object.geometry.getAttribute("position");
+  const positions = positionAttribute.array;
+
+  for (let i = 0; i < positions.length; i += 3) {
+    positions[i] += translation.x - currentX;
+    positions[i + 1] += translation.y - currentY;
+    positions[i + 2] += translation.z - currentZ;
+  }
+
+  // Reset the object's position to its current position
+  object.updateMatrixWorld(true);
+
+  // Mark the position attribute as needing an update
+  positionAttribute.needsUpdate = true;
+  object.geometry.computeVertexNormals();
+
+  object.position.set(0, 0, 0);
+
+  // Optional: Update normals
+}
+function rebuildFootprint(model) {
+  // Deprecated: Redundant. updateModelHelpers(model) already handles footprint rebuilding.
+}
+document.getElementById("Autoarrange").addEventListener("click", function () {
+  console.log("Starting Autoarrange with NfpPlacer...");
+
+  // 1. Gather all loaded models and compute footprints dynamically if needed
+  console.log("Total loaded models in array:", loadedModels.length);
+  const items = loadedModels
+    .map((m, originalIndex) => {
+      // Ensure the model's footprint is fully generated and updated in local unrotated space
+      if (m.mesh) {
+        updateModelHelpers(m);
+      }
+      return { model: m, originalIndex };
+    })
+    .filter(
+      (entry) =>
+        entry.model.mesh &&
+        entry.model.mesh.userData &&
+        entry.model.mesh.userData.footprint,
+    )
+    .map((entry) => ({
+      id: entry.originalIndex,
+      footprint: entry.model.mesh.userData.footprint,
+    }));
+
+  console.log("Number of valid 2D footprint shapes found:", items.length);
+  items.forEach((item, idx) => {
+    console.log(
+      `Footprint ${idx} (Original Model Index ${item.id}):`,
+      item.footprint.length,
+      "points:",
+      item.footprint,
+    );
+  });
+
+  if (items.length === 0) {
+    console.warn("No models with footprints found to arrange.");
+    return;
+  }
+
+  // 2. Run NfpPlacer. Bed size is 100x100 (-50 to 50 bounds), spacing is 3mm
+  const placer = new NfpPlacer(100, 3);
+  console.log(
+    "Running placer.arrange with items:",
+    JSON.stringify(
+      items.map((it) => ({
+        id: it.id,
+        len: it.footprint.length,
+        bounds: getPolygonBounds(it.footprint),
+      })),
+    ),
+  );
+  const results = placer.arrange(items);
+  console.log("Placement results:", JSON.stringify(results, null, 2));
+
+  // 3. Apply positions and rotations back to 3D meshes and their associated helper meshes
+  results.forEach((result) => {
+    const model = loadedModels[result.id];
+    if (!model) return;
+
+    console.log(
+      `Applying result to model ${result.id}: x=${result.x}, z=${result.y}, rotation=${result.rotation}`,
+    );
+
+    // Apply rotation and translation to the main 3D mesh
+    model.mesh.rotation.y = result.rotation;
+    model.mesh.position.x = result.x;
+    model.mesh.position.z = result.y; // The 2D y coordinate maps to 3D z coordinate
+    model.mesh.updateMatrixWorld(true);
+
+    // Apply same translation and rotation to finalMergedMesh (the rendered visual mesh) by copying directly from model.mesh
+    if (model.finalMergedMesh) {
+      model.finalMergedMesh.position.copy(model.mesh.position);
+      model.finalMergedMesh.rotation.copy(model.mesh.rotation);
+      model.finalMergedMesh.updateMatrixWorld(true);
+    }
+
+    // Update all helper geometries, positions, and rotations cleanly
+    updateModelHelpers(model);
+  });
+
+  console.log("=== Scene children after Autoarrange ===");
+  scene.children.forEach((child) => {
+    if (child.isMesh) {
+      console.log(
+        `Mesh type/name: "${child.name || child.constructor.name}", uuid: "${child.uuid}", pos:`,
+        child.position,
+        "rot:",
+        child.rotation,
+      );
+    }
+  });
+
+  console.log("Autoarrange complete.");
+});
+
+document
+  .getElementById("toggleConvex")
+  .addEventListener("change", function (e) {
+    loadedModels.forEach((model) => {
+      if (e.target.checked) {
+        ensureLayflatHelpers(model);
+      }
+      if (model.convexMesh) model.convexMesh.visible = e.target.checked;
+    });
+  });
+
+document
+  .getElementById("toggleFootprint")
+  .addEventListener("change", function (e) {
+    loadedModels.forEach((model) => {
+      if (model.footprintMesh) model.footprintMesh.visible = e.target.checked;
+    });
+  });
+
+document.getElementById("layflat").addEventListener("click", function () {
+  const btn = document.getElementById("layflat");
+  if (!isMouseDownEventAttached) {
+    // Lazy load layflat mesh and raycasts for the active model
+    if (meshes) {
+      const activeModel = loadedModels.find((m) => m.mesh === meshes);
+      if (activeModel) {
+        ensureLayflatHelpers(activeModel);
+        convexMesh = activeModel.convexMesh;
+        finalMergedMesh = activeModel.finalMergedMesh;
+        largestNeighbors = activeModel.largestNeighbors;
+      }
+    }
+
+    document.addEventListener("mousedown", onMouseClicksss, false);
+    isMouseDownEventAttached = true;
+    btn.style.backgroundColor = "#dc3545"; // Red color to indicate active mode
+    btn.textContent = "Exit Lay Flat";
+
+    // Remove coordinate axes line handles during layflat mode
+    if (xAxisLine) scene.remove(xAxisLine);
+    if (yAxisLine) scene.remove(yAxisLine);
+    if (zAxisLine) scene.remove(zAxisLine);
+
+    // Show merged mesh (highlighted face selection mode) only for the selected model
+    console.log("=== Lay Flat Active ===");
+    loadedModels.forEach((model) => {
+      if (model.mesh) {
+        console.log(
+          `Model Mesh Position:`,
+          model.mesh.position,
+          `Rotation:`,
+          model.mesh.rotation,
+        );
+      }
+      if (model.finalMergedMesh) {
+        console.log(
+          `finalMergedMesh Position:`,
+          model.finalMergedMesh.position,
+          `Rotation:`,
+          model.finalMergedMesh.rotation,
+        );
+      }
+      if (model.mesh && model.finalMergedMesh) {
+        const samePos = model.mesh.position.equals(
+          model.finalMergedMesh.position,
+        );
+        const sameRot = model.mesh.rotation.equals(
+          model.finalMergedMesh.rotation,
+        );
+        console.log(
+          `Do they have the same position?`,
+          samePos,
+          `rotation?`,
+          sameRot,
+        );
+      }
+      if (model.mesh === meshes) {
+        if (model.finalMergedMesh) model.finalMergedMesh.visible = true;
+      } else {
+        if (model.finalMergedMesh) model.finalMergedMesh.visible = false;
+      }
+      if (model.mesh) model.mesh.visible = true; // KEEP original meshes visible to prevent vanishing mesh
+    });
+  } else {
+    document.removeEventListener("mousedown", onMouseClicksss, false);
+    isMouseDownEventAttached = false;
+    btn.style.backgroundColor = "#2e8b57"; // Green color to indicate inactive mode
+    btn.textContent = "Lay Flat";
+
+    // Restore axes coordinate handles for the active model
+    if (meshes) {
+      createAxesLines(meshes);
+    }
+
+    // Hide merged mesh and show original mesh for all models
+    loadedModels.forEach((model) => {
+      if (model.finalMergedMesh) model.finalMergedMesh.visible = false;
+      if (model.mesh) model.mesh.visible = true;
+      if (model.convexMesh)
+        model.convexMesh.visible =
+          document.getElementById("toggleConvex").checked;
+    });
+  }
+});
+
+document.addEventListener("mousemove", onhighlight);
+
+// const neigbourfacesss = findAllNeighboringFaces(geometry, 58);
+//    console.log("negia",neigbourfacesss);
+
+function calculateMeshDimensions(mesh) {
+  const geometry = mesh.geometry;
+  const positions = geometry.attributes.position.array;
+
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+
+  for (let i = 0; i < positions.length; i += 3) {
+    const x = positions[i];
+    const y = positions[i + 1];
+
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+  }
+
+  const length = maxX - minX;
+  const width = maxY - minY;
+
+  return { length, width };
+}
+
+// Helper function to check for NaN values in an array
+function containsNaN(array) {
+  for (let i = 0; i < array.length; i++) {
+    if (isNaN(array[i])) {
+      return true;
+    }
+  }
+  return false;
+}
+function mergeMeshesIntoSingleMesh(meshes) {
+  const mergedGeometry = new THREE.BufferGeometry();
+  const mergedMaterial = new THREE.MeshBasicMaterial({
+    color: 0xff0000,
+    wireframe: true,
+  });
+
+  const mergedPositions = [];
+  const mergedNormals = [];
+
+  meshes.forEach((mesh) => {
+    const positions = mesh.geometry.getAttribute("position").array;
+    const normals = mesh.geometry.getAttribute("normal").array;
+
+    mergedPositions.push(...positions);
+    mergedNormals.push(...normals);
+  });
+
+  mergedGeometry.setAttribute(
+    "position",
+    new THREE.BufferAttribute(new Float32Array(mergedPositions), 3),
+  );
+  mergedGeometry.setAttribute(
+    "normal",
+    new THREE.BufferAttribute(new Float32Array(mergedNormals), 3),
+  );
+
+  // Create a mesh with the merged geometry and material
+  const mergedMesh = new THREE.Mesh(mergedGeometry, mergedMaterial);
+  return mergedMesh;
+}
+
+function getFaceNormal(geometry, faceIndex) {
+  const normals = geometry.attributes.normal.array;
+  const startIndex = faceIndex * 9;
+
+  return new THREE.Vector3(
+    normals[startIndex],
+    normals[startIndex + 1],
+    normals[startIndex + 2],
+  );
+}
+
+// Function to filter neighboring faces based on normals using dot product
+function filterNormalsBySelectedFace(
+  geometry,
+  selectedFaceNormal,
+  neighboringFaces,
+) {
+  return neighboringFaces.filter((neighboringFaceIndex) => {
+    const neighboringFaceNormal = getFaceNormal(geometry, neighboringFaceIndex);
+    // Normalize the vectors before computing the dot product
+    selectedFaceNormal.normalize();
+    neighboringFaceNormal.normalize();
+    // Compare normals using the dot product
+    const dotProduct = selectedFaceNormal.dot(neighboringFaceNormal);
+    // You can adjust the threshold based on your requirements
+    const threshold = 0.999; // Cosine of a small angle (e.g., 2 degrees)
+    return dotProduct > threshold;
+  });
+}
+function getFaceVerticess(geometry, faceIndex) {
+  const vertices = [];
+
+  if (geometry instanceof THREE.BufferGeometry) {
+    // Handle BufferGeometry
+    const positions = geometry.attributes.position.array;
+    const startIndex = faceIndex * 9;
+    for (let i = 0; i < 9; i += 3) {
+      vertices.push(
+        new THREE.Vector3(
+          positions[startIndex + i],
+          positions[startIndex + i + 1],
+          positions[startIndex + i + 2],
+        ),
+      );
+    }
+  } else if (THREE.Geometry && geometry instanceof THREE.Geometry) {
+    // Handle Geometry (deprecated in newer Three.js versions)
+    const face = geometry.faces[faceIndex];
+    const verticesIndices = [face.a, face.b, face.c];
+    verticesIndices.forEach((index) => {
+      const vertex = geometry.vertices[index];
+      vertices.push(new THREE.Vector3(vertex.x, vertex.y, vertex.z));
+    });
+  } else {
+    // Handle other geometry types as needed
+    // You might need additional checks for different geometry types
+  }
+
+  return vertices;
+}
+
+let highlightedFaceMeshes = []; // Assuming you maintain an array of highlighted face meshes
+
+function resetPreviousSelection() {
+  // Iterate over each highlighted face mesh
+  highlightedFaceMeshes.forEach((highlightedFaceMesh) => {
+    // Remove the highlighted face mesh from the scene
+    scene.remove(highlightedFaceMesh);
+    // Optionally, dispose of the geometry and material to free up resources
+    highlightedFaceMesh.geometry.dispose();
+    highlightedFaceMesh.material.dispose();
+  });
+
+  // Clear the array of highlighted face meshes
+  highlightedFaceMeshes = [];
+}
+
+// Function to highlight selected face
+function highlightSelectedFace(mesh, faceIndices) {
+  resetPreviousSelection();
+  highlightedFaceMeshes = [];
+
+  // Iterate over each face index
+  faceIndices.forEach((faceIndex) => {
+    // Create a new geometry for the highlighted face
+    const geometrys = new THREE.BufferGeometry();
+    const positions = mesh.geometry.attributes.position.array;
+    const normals = mesh.geometry.attributes.normal.array;
+
+    // Extract the vertices of the selected face
+    const startIndex = faceIndex * 9;
+    const endIndex = startIndex + 9;
+    const faceVertices = positions.slice(startIndex, endIndex);
+    const faceNormals = normals.slice(startIndex, endIndex);
+
+    // Set the position and normal attributes for the highlighted face
+    geometrys.setAttribute(
+      "position",
+      new THREE.BufferAttribute(new Float32Array(faceVertices), 3),
+    );
+    geometrys.setAttribute(
+      "normal",
+      new THREE.BufferAttribute(new Float32Array(faceNormals), 3),
+    );
+
+    // Create a new material for highlighting (e.g., red color)
+    const highlightMaterial = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    });
+
+    // Create a mesh with the highlighted face geometry and material
+    const highlightedFaceMesh = new THREE.Mesh(geometrys, highlightMaterial);
+
+    // Add the highlighted face mesh to the array
+    highlightedFaceMeshes.push(highlightedFaceMesh);
+
+    // Add the highlighted face mesh to the scene
+    scene.add(highlightedFaceMesh);
+  });
+
+  // Return the array of highlighted face meshes
+  return highlightedFaceMeshes;
+}
+
+let originalMaterials = null;
+
+function onhighlight(event) {
+  event.preventDefault();
+  if (isMouseDownEventAttached && finalMergedMesh) {
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    // Update the mouse coordinates
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    // Set up the raycaster
+    raycaster.setFromCamera(mouse, camera);
+
+    // Find intersected faces on the active selection's face highlight overlay
+    const intersects = raycaster.intersectObject(finalMergedMesh);
+
+    // Check if there is an intersection
+    if (intersects.length > 0) {
+      // Get the face index
+      const faceIndex = intersects[0].faceIndex * 3;
+      console.log("highlightfaceinject", faceIndex);
+
+      changeFaceMaterial(finalMergedMesh, faceIndex);
+    } else {
+      // Restore original materials if the mouse is not over the mesh
+      restoreOriginalMaterials(finalMergedMesh);
+    }
+  }
+}
+function changeFaceMaterial(mesh, faceIndex) {
+  // Store the original materials if not already stored
+  if (!originalMaterials) {
+    originalMaterials = mesh.material.map((material) => material.clone());
+  }
+
+  // Restore colors of all groups first to avoid stickiness
+  mesh.material.forEach((mat, idx) => {
+    if (originalMaterials && originalMaterials[idx]) {
+      mat.color.copy(originalMaterials[idx].color);
+    }
+  });
+
+  // Assuming mergedMesh has a BufferGeometry with groups
+  const groups = mesh.geometry.groups;
+
+  // Find the group that corresponds to the faceIndex
+  const group = groups.find(
+    (group) =>
+      faceIndex >= group.start && faceIndex < group.start + group.count,
+  );
+
+  // Check if the group is found
+  if (group) {
+    // Update the material for the specific group
+    mesh.material[group.materialIndex].color.set(0xff0000); // Set your desired color
+  }
+}
+
+function restoreOriginalMaterials(mesh) {
+  // Restore the original materials
+  if (originalMaterials) {
+    mesh.material.forEach((material, index) => {
+      if (originalMaterials[index]) {
+        material.color.copy(originalMaterials[index].color);
+      }
+    });
+    originalMaterials = null; // Reset originalMaterials after restoration
+  }
+}
+
+let transformationMatrixss = null;
+
+function onMouseClicksss(event) {
+  if (!isMouseDownEventAttached) return;
+  event.preventDefault();
+  mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+
+  // Raycast both original meshes and finalMergedMeshes so that clicking the object first works properly
+  const targets = [];
+  loadedModels.forEach((m) => {
+    if (m.finalMergedMesh && m.finalMergedMesh.visible)
+      targets.push(m.finalMergedMesh);
+    else if (m.mesh) targets.push(m.mesh);
+  });
+
+  const intersects = raycaster.intersectObjects(targets);
+
+  if (intersects.length > 0) {
+    const hitMesh = intersects[0].object;
+    const model = loadedModels.find(
+      (m) => m.finalMergedMesh === hitMesh || m.mesh === hitMesh,
+    );
+    if (!model) return;
+
+    // Set active model globals for layflat operation
+    meshes = model.mesh;
+    finalMergedMesh = model.finalMergedMesh;
+    convexMesh = model.convexMesh;
+    footprintMesh = model.footprintMesh;
+    boundingBoxMesh = model.boundingBoxMesh;
+    geometrys = model.mesh.geometry;
+
+    // Save pre-layflat position (X and Z) so the object doesn't snap to the bed center
+    const origX = meshes.position.x;
+    const origZ = meshes.position.z;
+
+    // Dynamically toggle finalMergedMesh and mesh visibility so only this model is shown in layflat face selection mode
+    loadedModels.forEach((m) => {
+      if (m.finalMergedMesh) {
+        m.finalMergedMesh.visible = m === model;
+      }
+      if (m.mesh) {
+        m.mesh.visible = true; // Keep original meshes visible
+      }
+    });
+
+    selectedFaceIndex = intersects[0].faceIndex;
+    console.log("Selected Face Index:", selectedFaceIndex);
+
+    console.log("=== BEFORE LAYFLAT RESET ===");
+    console.log(
+      "meshes position:",
+      meshes.position,
+      "rotation:",
+      meshes.rotation,
+    );
+    if (meshes.geometry.boundingBox)
+      console.log("meshes geometry boundingBox:", meshes.geometry.boundingBox);
+    if (finalMergedMesh) {
+      console.log(
+        "finalMergedMesh position:",
+        finalMergedMesh.position,
+        "rotation:",
+        finalMergedMesh.rotation,
+      );
+      if (finalMergedMesh.geometry.boundingBox)
+        console.log(
+          "finalMergedMesh geometry boundingBox:",
+          finalMergedMesh.geometry.boundingBox,
+        );
+    }
+
+    // Reset rotation and position to 0 to ensure clean initial matrices
+    meshes.rotation.set(0, 0, 0);
+    if (finalMergedMesh) finalMergedMesh.rotation.set(0, 0, 0);
+    meshes.position.set(0, 0, 0);
+    if (finalMergedMesh) finalMergedMesh.position.set(0, 0, 0);
+    meshes.updateMatrixWorld(true);
+    if (finalMergedMesh) finalMergedMesh.updateMatrixWorld(true);
+
+    const clickedMesh = intersects[0].object;
+    const isClickedHighlight = clickedMesh === finalMergedMesh;
+
+    // Map candidate face index to original face index of main mesh
+    const originalFaceIndex =
+      isClickedHighlight &&
+      finalMergedMesh &&
+      finalMergedMesh.userData &&
+      finalMergedMesh.userData.originalFaceIndices
+        ? finalMergedMesh.userData.originalFaceIndices[selectedFaceIndex]
+        : selectedFaceIndex;
+
+    // Source geometry for the clicked face
+    const clickedGeometry =
+      isClickedHighlight && convexMesh ? convexMesh.geometry : meshes.geometry;
+    const clickedObject =
+      isClickedHighlight && convexMesh ? convexMesh : meshes;
+
+    let selectedFaceNormals = getFaceNormal(clickedGeometry, originalFaceIndex);
+    console.log(
+      "Selected Face Normals (from clickedGeometry):",
+      selectedFaceNormals,
+    );
+
+    // Guard against zero-length or NaN normal vector
+    if (!selectedFaceNormals || selectedFaceNormals.lengthSq() < 1e-6) {
+      console.warn("Invalid face normal detected, skipping rotation");
+      selectedFaceNormals = new THREE.Vector3(0, 1, 0);
+    }
+
+    let rotationMatrix = calculateRotationMatrix(
+      selectedFaceNormals,
+      constantPlaneNormal,
+    );
+
+    // Apply rotation to both geometries
+    if (finalMergedMesh) finalMergedMesh.geometry.applyMatrix4(rotationMatrix);
+    meshes.geometry.applyMatrix4(rotationMatrix);
+
+    meshes.updateMatrixWorld(true);
+    if (finalMergedMesh) finalMergedMesh.updateMatrixWorld(true);
+
+    const afeterrotations = getFacePositions(
+      clickedGeometry,
+      originalFaceIndex,
+      clickedObject,
+    );
+
+    let transformation = calculateTransformationMatrixs(
+      originalFaceIndex,
+      plane,
+      clickedObject,
+      afeterrotations,
+    );
+
+    // Apply the same translation to both geometries
+    if (finalMergedMesh) finalMergedMesh.geometry.applyMatrix4(transformation);
+    meshes.geometry.applyMatrix4(transformation);
+
+    meshes.geometry.verticesNeedUpdate = true;
+    meshes.geometry.normalsNeedUpdate = true;
+    if (meshes.geometry.attributes.position)
+      meshes.geometry.attributes.position.needsUpdate = true;
+
+    if (finalMergedMesh) {
+      finalMergedMesh.geometry.verticesNeedUpdate = true;
+      finalMergedMesh.geometry.normalsNeedUpdate = true;
+      if (finalMergedMesh.geometry.attributes.position)
+        finalMergedMesh.geometry.attributes.position.needsUpdate = true;
+    }
+
+    meshes.updateMatrixWorld(true);
+    if (finalMergedMesh) finalMergedMesh.updateMatrixWorld(true);
+
+    boundingBox.setFromObject(meshes);
+    boundingBox.getCenter(boundingBoxCenter);
+
+    const offsets = resetMeshOrigin(meshes);
+    console.log("resetMeshOrigin offsets:", offsets);
+    if (finalMergedMesh) {
+      resetMeshOrigin(finalMergedMesh, null, offsets);
+    }
+
+    // Restore the X and Z position on the bed
+    meshes.position.x = origX;
+    meshes.position.z = origZ;
+    meshes.updateMatrixWorld(true);
+
+    // Keep original finalMergedMesh and align its position, rotation, and matrix to meshes
+    if (finalMergedMesh) {
+      finalMergedMesh.position.copy(meshes.position);
+      finalMergedMesh.rotation.copy(meshes.rotation);
+      finalMergedMesh.updateMatrixWorld(true);
+    }
+
+    console.log("=== AFTER LAYFLAT RESTORE ===");
+    console.log(
+      "meshes position:",
+      meshes.position,
+      "rotation:",
+      meshes.rotation,
+      "uuid:",
+      meshes.uuid,
+    );
+    meshes.geometry.computeBoundingBox();
+    console.log(
+      "meshes geometry boundingBox center:",
+      meshes.geometry.boundingBox.getCenter(new THREE.Vector3()),
+    );
+    if (finalMergedMesh) {
+      console.log(
+        "finalMergedMesh position:",
+        finalMergedMesh.position,
+        "rotation:",
+        finalMergedMesh.rotation,
+        "uuid:",
+        finalMergedMesh.uuid,
+      );
+      finalMergedMesh.geometry.computeBoundingBox();
+      console.log(
+        "finalMergedMesh geometry boundingBox center:",
+        finalMergedMesh.geometry.boundingBox.getCenter(new THREE.Vector3()),
+      );
+    }
+
+    boundingBox.setFromObject(meshes);
+    boundingBox.getCenter(boundingBoxCenter);
+    boundingBoxMesh.position.copy(boundingBoxCenter);
+    boundingBoxMesh.rotation.copy(meshes.rotation);
+
+    updateModelHelpers(model);
+
+    rebuildFootprint(model);
+
+    // Regenerate the highlight mesh to align with the newly transformed convexMesh
+    const selectedOuterFaces = layflat.selectOuterFacesAutomatically(
+      model.convexMesh.geometry,
+    );
+    if (model.finalMergedMesh) {
+      scene.remove(model.finalMergedMesh);
+      if (model.finalMergedMesh.geometry)
+        model.finalMergedMesh.geometry.dispose();
+    }
+    model.finalMergedMesh = selectedNeighbours(
+      model.convexMesh.geometry,
+      selectedOuterFaces,
+    );
+    finalMergedMesh = model.finalMergedMesh; // update active global
+    if (model.finalMergedMesh) {
+      model.finalMergedMesh.position.copy(model.mesh.position);
+      model.finalMergedMesh.rotation.copy(model.mesh.rotation);
+      model.finalMergedMesh.updateMatrixWorld(true);
+    }
+
+    if (model.finalMergedMesh) model.finalMergedMesh.visible = true;
+    if (model.mesh) model.mesh.visible = true;
+
+    // Explicitly make sure dragging is NOT triggered by the layflat click
+    isDragging = false;
+    controls.enabled = true;
+  }
+}
+
+function autoplace(finalMergedMesh, meshes, selectedFaceIndex) {
+  // Save pre-layflat position (X and Z) so the object doesn't snap to the bed center
+  const origX = meshes.position.x;
+  const origZ = meshes.position.z;
+
+  // Reset rotation and position to 0 to ensure clean initial matrices
+  meshes.rotation.set(0, 0, 0);
+  if (finalMergedMesh) finalMergedMesh.rotation.set(0, 0, 0);
+  meshes.position.set(0, 0, 0);
+  if (finalMergedMesh) finalMergedMesh.position.set(0, 0, 0);
+  meshes.updateMatrixWorld(true);
+  if (finalMergedMesh) finalMergedMesh.updateMatrixWorld(true);
+
+  const model = loadedModels.find((m) => m.mesh === meshes);
+  if (!model) return;
+
+  // Map candidate face index to original face index of main mesh
+  const originalFaceIndex =
+    finalMergedMesh.userData && finalMergedMesh.userData.originalFaceIndices
+      ? finalMergedMesh.userData.originalFaceIndices[selectedFaceIndex]
+      : selectedFaceIndex;
+
+  const clickedGeometry = model.convexMesh
+    ? model.convexMesh.geometry
+    : finalMergedMesh.geometry;
+  const clickedObject = model.convexMesh || finalMergedMesh;
+
+  let selectedFaceNormals = getFaceNormal(clickedGeometry, originalFaceIndex);
+  console.log("Selected Face Normals:", selectedFaceNormals);
+
+  // Guard against zero-length or NaN normal vector
+  if (!selectedFaceNormals || selectedFaceNormals.lengthSq() < 1e-6) {
+    console.warn("Invalid face normal detected, skipping rotation");
+    selectedFaceNormals = new THREE.Vector3(0, 1, 0);
+  }
+
+  let rotationMatrix = calculateRotationMatrix(
+    selectedFaceNormals,
+    constantPlaneNormal,
+  );
+
+  // Apply rotation to both geometries
+  if (finalMergedMesh) finalMergedMesh.geometry.applyMatrix4(rotationMatrix);
+  meshes.geometry.applyMatrix4(rotationMatrix);
+
+  meshes.updateMatrixWorld(true);
+  if (finalMergedMesh) finalMergedMesh.updateMatrixWorld(true);
+
+  const afeterrotations = getFacePositions(
+    clickedGeometry,
+    originalFaceIndex,
+    clickedObject,
+  );
+
+  let transformation = calculateTransformationMatrixs(
+    originalFaceIndex,
+    plane,
+    clickedObject,
+    afeterrotations,
+  );
+
+  // Apply the same translation to both geometries
+  if (finalMergedMesh) finalMergedMesh.geometry.applyMatrix4(transformation);
+  meshes.geometry.applyMatrix4(transformation);
+
+  meshes.geometry.verticesNeedUpdate = true;
+  meshes.geometry.normalsNeedUpdate = true;
+  if (meshes.geometry.attributes.position)
+    meshes.geometry.attributes.position.needsUpdate = true;
+
+  if (finalMergedMesh) {
+    finalMergedMesh.geometry.verticesNeedUpdate = true;
+    finalMergedMesh.geometry.normalsNeedUpdate = true;
+    if (finalMergedMesh.geometry.attributes.position)
+      finalMergedMesh.geometry.attributes.position.needsUpdate = true;
+  }
+
+  meshes.updateMatrixWorld(true);
+  if (finalMergedMesh) finalMergedMesh.updateMatrixWorld(true);
+
+  boundingBox.setFromObject(meshes);
+  boundingBox.getCenter(boundingBoxCenter);
+
+  const offsets = resetMeshOrigin(meshes);
+  if (finalMergedMesh) {
+    resetMeshOrigin(finalMergedMesh, null, offsets);
+  }
+
+  // Restore the X and Z position on the bed
+  meshes.position.x = origX;
+  meshes.position.z = origZ;
+  meshes.updateMatrixWorld(true);
+
+  // Keep original finalMergedMesh and align its position, rotation, and matrix to meshes
+  if (finalMergedMesh) {
+    finalMergedMesh.position.copy(meshes.position);
+    finalMergedMesh.rotation.copy(meshes.rotation);
+    finalMergedMesh.updateMatrixWorld(true);
+  }
+
+  boundingBox.setFromObject(meshes);
+  boundingBox.getCenter(boundingBoxCenter);
+  boundingBoxMesh.position.copy(boundingBoxCenter);
+  boundingBoxMesh.rotation.copy(meshes.rotation);
+
+  // Sync convex hull and footprint helper geometries
+  updateModelHelpers(model);
+
+  // Rebuild footprint
+  rebuildFootprint(model);
+
+  // Regenerate highlight mesh
+  const selectedOuterFaces = layflat.selectOuterFacesAutomatically(
+    model.convexMesh.geometry,
+  );
+  if (model.finalMergedMesh) {
+    scene.remove(model.finalMergedMesh);
+    if (model.finalMergedMesh.geometry)
+      model.finalMergedMesh.geometry.dispose();
+  }
+  model.finalMergedMesh = selectedNeighbours(
+    model.convexMesh.geometry,
+    selectedOuterFaces,
+  );
+  if (model.finalMergedMesh) {
+    model.finalMergedMesh.position.copy(model.mesh.position);
+    model.finalMergedMesh.rotation.copy(model.mesh.rotation);
+    model.finalMergedMesh.updateMatrixWorld(true);
+  }
+}
+
+function updateModelHelpers(model) {
+  if (!model || !model.mesh) return;
+
+  // 1. Re-extract points from model.mesh.geometry (which has been transformed)
+  const positions = model.mesh.geometry.attributes.position.array;
+  const points = [];
+  for (let i = 0; i < positions.length; i += 3) {
+    points.push(
+      new THREE.Vector3(positions[i], positions[i + 1], positions[i + 2]),
+    );
+  }
+
+  // 2. Update Convex Hull Geometry (downsampled to max 2000 points for fast performance on complex/3MF meshes)
+  if (model.convexMesh) {
+    const totalPoints = points.length;
+    const maxVerticesForHull = 2000;
+    const step = Math.max(1, Math.floor(totalPoints / maxVerticesForHull));
+    const downsampledPoints = [];
+    for (let i = 0; i < totalPoints; i += step) {
+      downsampledPoints.push(points[i]);
+    }
+    const convexGeometry = new ConvexGeometry(downsampledPoints);
+    if (model.convexMesh.geometry) model.convexMesh.geometry.dispose();
+    model.convexMesh.geometry = convexGeometry;
+
+    // Sync position and rotation to match the model mesh
+    model.convexMesh.position.copy(model.mesh.position);
+    model.convexMesh.rotation.copy(model.mesh.rotation);
+    model.convexMesh.updateMatrixWorld(true);
+  }
+
+  // 3. Update 2D Footprint projection directly from model.mesh.geometry
+  const projected = getProjectedVertices(model.mesh.geometry);
+  const footprintPoints = computeConvexHull(projected);
+  const footprintShape = createShapeFromPoints(footprintPoints);
+  if (footprintShape) {
+    const footprintGeometry = new THREE.ShapeGeometry(footprintShape);
+    if (!model.footprintMesh) {
+      const footprintMaterial = new THREE.MeshBasicMaterial({
+        color: 0x00ffff,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.5,
+      });
+      model.footprintMesh = new THREE.Mesh(
+        footprintGeometry,
+        footprintMaterial,
+      );
+      model.footprintMesh.rotation.order = "YXZ";
+      model.footprintMesh.rotation.x = Math.PI / 2;
+      scene.add(model.footprintMesh);
+    } else {
+      if (model.footprintMesh.geometry)
+        model.footprintMesh.geometry.dispose();
+      model.footprintMesh.geometry = footprintGeometry;
+    }
+
+    // Sync position and rotation of the footprint mesh to match the model mesh
+    model.footprintMesh.position.x = model.mesh.position.x;
+    model.footprintMesh.position.z = model.mesh.position.z;
+    model.footprintMesh.position.y = 0.05;
+    model.footprintMesh.rotation.y = model.mesh.rotation.y;
+    model.footprintMesh.rotation.z = 0;
+    model.footprintMesh.updateMatrixWorld(true);
+
+    model.footprintMesh.visible =
+      document.getElementById("toggleFootprint").checked;
+
+    // Update stored footprint coordinates in userData
+    model.mesh.userData.footprint = footprintPoints.map((point) => ({
+      x: point.x,
+      y: point.y,
+    }));
+  }
+
+  // 4. Update Bounding Box Geometry
+  if (model.boundingBoxMesh) {
+    const box = new THREE.Box3().setFromObject(model.mesh);
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    model.boundingBoxMesh.position.copy(center);
+
+    const wireframeGeometry = new THREE.BoxGeometry(
+      box.max.x - box.min.x,
+      box.max.y - box.min.y,
+      box.max.z - box.min.z,
+    );
+    if (model.boundingBoxMesh.geometry)
+      model.boundingBoxMesh.geometry.dispose();
+    model.boundingBoxMesh.geometry = wireframeGeometry;
+    model.boundingBoxMesh.updateMatrixWorld();
+  }
+}
+
+// Remove duplicate resetMeshOrigin function
+
+let xAxisLine, yAxisLine, zAxisLine;
+function createAxesLines(mesh) {
+  // Extract the columns of the mesh matrix (local coordinate axes)
+  const xAxis = new THREE.Vector3().fromArray(mesh.matrix.elements.slice(0, 3));
+  const yAxis = new THREE.Vector3().fromArray(mesh.matrix.elements.slice(4, 7));
+  const zAxis = new THREE.Vector3().fromArray(
+    mesh.matrix.elements.slice(8, 11),
+  );
+
+  // Remove existing lines if they exist
+  if (xAxisLine) scene.remove(xAxisLine);
+  if (yAxisLine) scene.remove(yAxisLine);
+  if (zAxisLine) scene.remove(zAxisLine);
+
+  // Create lines along the local coordinate axes
+  xAxisLine = new THREE.ArrowHelper(xAxis, mesh.position, 30, 0xff0000);
+  yAxisLine = new THREE.ArrowHelper(yAxis, mesh.position, 30, 0x00ff00);
+  zAxisLine = new THREE.ArrowHelper(zAxis, mesh.position, 30, 0x0000ff);
+
+  // Add the lines to the scene
+  scene.add(xAxisLine);
+  scene.add(yAxisLine);
+  scene.add(zAxisLine);
+}
+
+function calculateTransformationMatrixs(
+  faceIndex,
+  planeMesh,
+  mesh,
+  facePosition,
+) {
+  // Ensure geometry is updated
+
+  mesh.updateMatrixWorld();
+  const planeNormal = new THREE.Vector3(0, -1, 0);
+  const planePosition = planeMesh.position;
+  console.log("facetransformation", planePosition);
+
+  // Calculate the vector from the face position to a point on the plane
+  const vectorToPlane = new THREE.Vector3().subVectors(
+    facePosition,
+    planePosition,
+  );
+
+  // Project the vector onto the plane's normal to find the distance to the plane
+  const distanceToPlane = vectorToPlane.dot(planeNormal) * 2;
+  console.log("distanceto the plane", distanceToPlane);
+
+  // Get the vertices of the selected face
+  const faceVertices = getFaceVertices(mesh.geometry, faceIndex);
+  console.log("faceposition", faceVertices);
+  const faceBoundingBox = new THREE.Box3().setFromObject(mesh);
+
+  // Calculate the center of the bounding box
+  const boundingBoxCenter = new THREE.Vector3();
+  faceBoundingBox.getCenter(boundingBoxCenter);
+  console.log("bouanklsdlfnansd", boundingBox);
+  console.log("meshesd", mesh);
+
+  // Calculate the center of the face
+  const faceCenter = new THREE.Vector3();
+  faceVertices.forEach((vertex) => faceCenter.add(vertex));
+  faceCenter.divideScalar(faceVertices.length);
+
+  // Create a translation matrix to move the object's origin to the face center and then move up to the top of the plane
+  const translationMatrix = new THREE.Matrix4().makeTranslation(
+    -boundingBoxCenter.x,
+    faceCenter.y + distanceToPlane,
+    -boundingBoxCenter.z,
+  );
+  mesh.positionNeedUpdate = true;
+  console.log("transla", translationMatrix);
+
+  console.log("facecenter", faceCenter);
+  return translationMatrix;
+}
+function resetMeshOrigin(
+  mesh,
+  referenceMesh = null,
+  precalculatedOffsets = null,
+) {
+  // Reset the position of the mesh to local origin (0, 0, 0)
+  mesh.position.set(0, 0, 0);
+
+  // Update the matrix world to apply the position change
+  mesh.updateMatrixWorld(true);
+
+  let dx, dy, dz;
+  if (precalculatedOffsets) {
+    dx = precalculatedOffsets.dx;
+    dy = precalculatedOffsets.dy;
+    dz = precalculatedOffsets.dz;
+  } else {
+    // Compute the bounding box of the reference mesh (the main model) or itself
+    const targetBoxMesh = referenceMesh || mesh;
+    const boundingBox = new THREE.Box3().setFromObject(targetBoxMesh);
+
+    const center = new THREE.Vector3();
+    boundingBox.getCenter(center);
+
+    // Find the local minimum Y. Since targetBoxMesh is at position (0, 0, 0),
+    // the global boundingBox.min.y is identical to the local minimum Y.
+    const localMinY = boundingBox.min.y;
+
+    dx = -center.x;
+    dy = -localMinY;
+    dz = -center.z;
+  }
+
+  // Translate the geometry to center in X/Z and align the bottom (minimum Y) at Y = 0
+  mesh.geometry.translate(dx, dy, dz);
+  mesh.geometry.verticesNeedUpdate = true;
+  mesh.geometry.normalsNeedUpdate = true;
+
+  // Update the matrix world again
+  mesh.updateMatrixWorld(true);
+
+  return { dx, dy, dz };
+}
+
+function getFacePositions(geometry, faceIndex, mesh) {
+  const positions = geometry.attributes.position.array;
+  const startIndex = faceIndex * 3 * 3;
+
+  // Calculate the average position of the vertices to get the face position in local coordinates
+  const localPosition = new THREE.Vector3();
+  for (let i = 0; i < 3; i++) {
+    const index = startIndex + i * 3;
+    const x = positions[index];
+    const y = positions[index + 1];
+    const z = positions[index + 2];
+
+    localPosition.add(new THREE.Vector3(x, y, z));
+  }
+  localPosition.divideScalar(3);
+  console.log("local", localPosition);
+
+  // Convert the local face position to global coordinates by applying the mesh's matrixWorld
+  const globalPosition = localPosition.clone().applyMatrix4(mesh.matrixWorld);
+  //   console.log("meshworld",mesh.matrixWorld);
+
+  return globalPosition;
+}
+
+let singlemeshes = null;
+
+let negibourefaces = [];
+let finalMergedMesh = null;
+let results = null;
+let largestNeighbors = null;
+
+function selectedNeighbours(geometry, selectedOuterFaces) {
+  let mergedMeshes = [];
+  const faceMaterials = [];
+  const originalFaceIndicesMap = [];
+
+  for (const selectedFaceIndex of selectedOuterFaces) {
+    const normal = getFaceNormal(geometry, selectedFaceIndex);
+    const neighbors = findAllNeighboringFaces(geometry, selectedFaceIndex);
+
+    // Map the selected face (1 face)
+    originalFaceIndicesMap.push(selectedFaceIndex);
+    // Map the neighbor faces (neighbors.length faces)
+    neighbors.forEach((nIndex) => {
+      originalFaceIndicesMap.push(nIndex);
+    });
+
+    highlightFilteredNormals(
+      geometry,
+      selectedFaceIndex,
+      neighbors,
+      mergedMeshes,
+    );
+  }
+
+  // Merge all the merged meshes into a single mesh
+  const localMergedMesh = mergeMeshes(mergedMeshes);
+  localMergedMesh.faceMaterials = faceMaterials;
+  localMergedMesh.userData = {
+    originalFaceIndices: originalFaceIndicesMap,
+  };
+
+  // Add the final merged mesh to the scene
+  scene.add(localMergedMesh);
+  localMergedMesh.visible = false; // Start hidden
+
+  return localMergedMesh;
+}
+
+function findLargestNeighborIndex(geometry, intersectionResults) {
+  let largestNeighbor = -1; // Initialize with an invalid index
+  let largestSize = 0; // Initialize with a size of 0
+
+  for (const result of intersectionResults) {
+    const selectedFaceIndex = result.selectedFaceIndex;
+    const neighborIndices = result.neighborIndices;
+
+    const dimensions = findCombinedFaceDimensions(
+      geometry,
+      neighborIndices,
+      selectedFaceIndex,
+    );
+    const combinedSize = calculateSizeFromDimensions(dimensions);
+    console.log("faceindex", selectedFaceIndex, combinedSize);
+
+    if (combinedSize > largestSize) {
+      largestSize = combinedSize;
+      largestNeighbor = selectedFaceIndex;
+    }
+  }
+
+  console.log("largestnode", largestNeighbor);
+  return largestNeighbor;
+}
+
+function calculateSizeFromDimensions(dimensions) {
+  const area = dimensions.width + dimensions.height + dimensions.depth;
+  return area;
+}
+
+function raycastFaces(
+  geometry,
+  selectedOuterFaces,
+  originalMeshgeometry,
+  threshold,
+) {
+  const raycasters = new THREE.Raycaster();
+  const intersectionResults = [];
+
+  for (const selectedFaceIndex of selectedOuterFaces) {
+    // Create a copy of the face's normal to invert it
+    let invertedNormal = getFaceNormal(geometry, selectedFaceIndex);
+    invertedNormal.negate();
+    let neigboured = null;
+    // Create a vector representing the face's position
+    const facePosition = getFacePosition(geometry, selectedFaceIndex);
+
+    raycasters.set(facePosition, invertedNormal);
+
+    // Get the intersection point and face index on the original mesh
+    const intersection = raycasters.intersectObject(originalMeshgeometry, true);
+
+    if (intersection.length > 0) {
+      const distance = getDistance(intersection[0].point, facePosition);
+
+      if (distance <= threshold) {
+        const neighbors = findAllNeighboringFaces(geometry, selectedFaceIndex);
+        intersectionResults.push({
+          selectedFaceIndex,
+          neighborIndices: neighbors,
+        });
+        continue;
+      }
+    } else {
+      neigboured = findAllNeighboringFaces(geometry, selectedFaceIndex);
+
+      const neighborIndices = [];
+
+      for (const neighborIndex of neigboured) {
+        const neighborFacePosition = getFacePosition(geometry, neighborIndex);
+        const invertedNormals = getFaceNormal(geometry, neighborIndex);
+        invertedNormal.negate();
+        raycasters.set(neighborFacePosition, invertedNormals);
+
+        const neighborIntersection = raycasters.intersectObject(
+          originalMeshgeometry,
+          true,
+        );
+
+        if (neighborIntersection.length > 0) {
+          const neighborDistance = getDistance(
+            neighborIntersection[0].point,
+            neighborFacePosition,
+          );
+          if (neighborDistance <= threshold) {
+            neighborIndices.push(neighborIndex);
+          }
+        }
+      }
+
+      if (neighborIndices.length > 0) {
+        intersectionResults.push({ selectedFaceIndex, neighborIndices });
+      }
+    }
+  }
+
+  return intersectionResults;
+}
+
+// Additional helper functions
+function getIntersectedFaceIndex(intersection) {
+  // Assuming the intersection object contains a reference to the face index
+  return intersection.faceIndex;
+}
+
+function getDistance(point1, point2) {
+  // Calculate the distance between two points using Euclidean distance formula
+  const dx = point2.x - point1.x;
+  const dy = point2.y - point1.y;
+  const dz = point2.z - point1.z;
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+//   const centered=  findCenterOfNeighboringFaces(geometry, neighbors,selectedFaceIndex);
+//  const dimension= findCombinedFaceDimensions(geometry, neighbors);
+//  console.log("centerd",centered);
+//  const planeMesh = createPlaneMesh(centered, normal, dimension, color);
+// scene.add(planeMesh);
+// console.log("plane",planeMesh);
+
+//console.log("mesd",singlemeshes);
+//selectedNeighbours(farthestFaces, geometry);
+function getFacePosition(geometry, faceIndex) {
+  const vertices = getFaceVertices(geometry, faceIndex);
+
+  // Calculate the average position of the vertices to get the face position
+  const position = {
+    x: (vertices[0].x + vertices[1].x + vertices[2].x) / 3,
+    y: (vertices[0].y + vertices[1].y + vertices[2].y) / 3,
+    z: (vertices[0].z + vertices[1].z + vertices[2].z) / 3,
+  };
+
+  return position;
+}
+
+function getFaceNormals(geometry, faceIndex) {
+  const normal = new THREE.Vector3();
+
+  // Get the vertices of the face
+  const vertices = getFaceVerticess(geometry, faceIndex);
+  console.log(vertices);
+
+  if (vertices.length >= 3) {
+    // Calculate the face normal using the cross product of two edges
+    const edge1 = new THREE.Vector3().subVectors(vertices[1], vertices[0]);
+    const edge2 = new THREE.Vector3().subVectors(vertices[2], vertices[0]);
+
+    // Ensure the vertices form a valid face (at least three vertices)
+    normal.crossVectors(edge1, edge2).normalize();
+  }
+
+  return normal;
+}
+
+// Replace with your constant plane normal
+
+function calculateRotationMatrix(selectedFaceNormal, constantPlaneNormal) {
+  const axis = new THREE.Vector3()
+    .crossVectors(selectedFaceNormal, constantPlaneNormal)
+    .normalize();
+  console.log(" axis", axis);
+
+  const angle = Math.acos(
+    selectedFaceNormal.dot(constantPlaneNormal) /
+      (selectedFaceNormal.length() * constantPlaneNormal.length()),
+  );
+
+  // Ensure axis is consistently pointing away from the constant plane normal
+
+  const rotationMatrix = new THREE.Matrix4();
+  rotationMatrix.makeRotationAxis(axis, angle);
+
+  return rotationMatrix;
+}
+
+function findCenterOfNeighboringFaces(geometry, neighboringFaces, slectedface) {
+  const center = new THREE.Vector3();
+
+  neighboringFaces.forEach((faceIndex) => {
+    const faceVertices = getFaceVerticx(geometry, faceIndex);
+    const faceCenter = calculateFaceCenter(faceVertices);
+    center.add(faceCenter);
+  });
+
+  // If there are no neighboring faces, use the center of the selected face
+  if (neighboringFaces.length === 0) {
+    const selectedFaceVertices = getFaceVerticx(geometry, slectedface);
+    center.copy(calculateFaceCenter(selectedFaceVertices));
+  } else {
+    center.divideScalar(neighboringFaces.length);
+  }
+
+  return center;
+}
+function calculateFaceCenter(faceVertices) {
+  const center = new THREE.Vector3();
+
+  for (let i = 0; i < faceVertices.length; i++) {
+    center.add(faceVertices[i]);
+  }
+
+  center.divideScalar(faceVertices.length);
+
+  return center;
+}
+
+// Draw a line from the center to some point (e.g., origin)
+
+function getFaceVerticx(geometry, faceIndex) {
+  const positions = geometry.attributes.position.array;
+  const startIndex = faceIndex * 9;
+  return [
+    new THREE.Vector3(
+      positions[startIndex],
+      positions[startIndex + 1],
+      positions[startIndex + 2],
+    ),
+    new THREE.Vector3(
+      positions[startIndex + 3],
+      positions[startIndex + 4],
+      positions[startIndex + 5],
+    ),
+    new THREE.Vector3(
+      positions[startIndex + 6],
+      positions[startIndex + 7],
+      positions[startIndex + 8],
+    ),
+  ];
+}
+
+function findCombinedFaceDimensions(
+  geometry,
+  neighboringFaces,
+  selectedFaceIndex,
+) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let maxZ = -Infinity;
+
+  // Include the vertices of the selected face
+  const selectedFaceVertices = getFaceVerticx(geometry, selectedFaceIndex);
+  selectedFaceVertices.forEach((vertex) => {
+    minX = Math.min(minX, vertex.x);
+    minY = Math.min(minY, vertex.y);
+    minZ = Math.min(minZ, vertex.z);
+    maxX = Math.max(maxX, vertex.x);
+    maxY = Math.max(maxY, vertex.y);
+    maxZ = Math.max(maxZ, vertex.z);
+  });
+
+  if (neighboringFaces.length === 0) {
+    // If there are no neighboring faces, use the vertices of the selected face
+    const selectedFaceVertices = getFaceVerticx(geometry, selectedFaceIndex);
+
+    selectedFaceVertices.forEach((vertex) => {
+      minX = Math.min(minX, vertex.x);
+      minY = Math.min(minY, vertex.y);
+      minZ = Math.min(minZ, vertex.z);
+      maxX = Math.max(maxX, vertex.x);
+      maxY = Math.max(maxY, vertex.y);
+      maxZ = Math.max(maxZ, vertex.z);
+    });
+  } else {
+    neighboringFaces.forEach((faceIndex) => {
+      const faceVertices = getFaceVerticx(geometry, faceIndex);
+
+      faceVertices.forEach((vertex) => {
+        minX = Math.min(minX, vertex.x);
+        minY = Math.min(minY, vertex.y);
+        minZ = Math.min(minZ, vertex.z);
+        maxX = Math.max(maxX, vertex.x);
+        maxY = Math.max(maxY, vertex.y);
+        maxZ = Math.max(maxZ, vertex.z);
+      });
+    });
+  }
+
+  const dimensions = {
+    width: maxX - minX,
+    height: maxY - minY,
+    depth: maxZ - minZ,
+  };
+
+  return dimensions;
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+animate();

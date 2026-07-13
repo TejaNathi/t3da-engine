@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "@3mfconsortium/lib3mf": "^2.5.0-fix.2",
+    "three": "^0.160.1"
+  },
+  "devDependencies": {
+    "webpack-dev-server": "^4.15.1"
+  }
+}
